@@ -31,6 +31,12 @@ var chatSearchQuery string = ""
 var viewingArchived bool = false
 var replyTargetMsg *messages.Message
 var expandedImages = make(map[string]bool)
+var emojiPicker *tview.List
+var emojiPickerMatches []emojiEntry
+var emojiPickerPrefix string
+var emojiPickerDismissedQuery string
+var draftLines []string
+var multilinePreview *tview.TextView
 
 type archivedNavAction int
 
@@ -115,14 +121,263 @@ func main() {
 	PrintHelp()
 
 	textInput = tview.NewInputField()
+	initEmojiPicker()
+	go initEmojiCatalog()
+	initMultilinePreview()
+	setupTextInput()
+
+	gridLayout.AddItem(topBar, 0, 0, 1, 4, 0, 0, false)
+	gridLayout.AddItem(infoBar, 2, 0, 1, 1, 0, 0, false)
+	gridLayout.AddItem(MakeTree(), 1, 0, 1, 1, 0, 0, false)
+	gridLayout.AddItem(textView, 1, 1, 1, 3, 0, 0, false)
+	gridLayout.AddItem(textInput, 2, 1, 1, 3, 0, 0, false)
+
+	app.SetRoot(gridLayout, true)
+	app.SetAfterDrawFunc(drawOverlays)
+	app.EnableMouse(true)
+	app.SetFocus(textInput)
+	if err := sessionManager.StartManager(); err != nil {
+		PrintError(err)
+	}
+	LoadShortcuts()
+	app.Run()
+}
+
+func initEmojiPicker() {
+	emojiPicker = tview.NewList().ShowSecondaryText(false)
+	emojiPicker.SetBorder(true).
+		SetTitle(" Emoji ").
+		SetBackgroundColor(tcell.ColorNames[config.Config.Colors.Background]).
+		SetBorderColor(tcell.ColorNames[config.Config.Colors.Borders])
+	emojiPicker.SetMainTextColor(tcell.ColorNames[config.Config.Colors.Text]).
+		SetSelectedTextColor(tcell.ColorNames[config.Config.Colors.InputText]).
+		SetSelectedBackgroundColor(tcell.ColorNames[config.Config.Colors.InputBackground]).
+		SetHighlightFullLine(true)
+}
+
+func emojiPickerVisible() bool {
+	return emojiPicker != nil && len(emojiPickerMatches) > 0 && textInput != nil && textInput.HasFocus()
+}
+
+func hideEmojiPicker() {
+	emojiPickerMatches = nil
+	emojiPickerPrefix = ""
+}
+
+func updateEmojiPicker(currentText string) {
+	prefix, query, ok := trailingEmojiQuery(currentText)
+	if !ok {
+		emojiPickerDismissedQuery = ""
+		hideEmojiPicker()
+		return
+	}
+	if query == emojiPickerDismissedQuery {
+		hideEmojiPicker()
+		return
+	}
+	matches := searchEmojis(query, 8)
+	if len(matches) == 0 {
+		hideEmojiPicker()
+		return
+	}
+	emojiPicker.Clear()
+	for _, m := range matches {
+		emojiPicker.AddItem(fmt.Sprintf(" %s  :%s:", m.Emoji, m.Code), "", 0, nil)
+	}
+	emojiPickerMatches = matches
+	emojiPickerPrefix = prefix
+	emojiPicker.SetCurrentItem(0)
+}
+
+func moveEmojiPicker(delta int) {
+	if len(emojiPickerMatches) == 0 {
+		return
+	}
+	idx := (emojiPicker.GetCurrentItem() + delta) % len(emojiPickerMatches)
+	if idx < 0 {
+		idx += len(emojiPickerMatches)
+	}
+	emojiPicker.SetCurrentItem(idx)
+}
+
+func acceptEmojiPickerSelection() bool {
+	if !emojiPickerVisible() {
+		return false
+	}
+	idx := emojiPicker.GetCurrentItem()
+	if idx < 0 || idx >= len(emojiPickerMatches) {
+		idx = 0
+	}
+	chosen := emojiPickerMatches[idx]
+	newText := emojiPickerPrefix + chosen.Emoji + " "
+	hideEmojiPicker()
+	emojiPickerDismissedQuery = ""
+	sndTxt = newText
+	textInput.SetText(newText)
+	syncScreen()
+	return true
+}
+
+func initMultilinePreview() {
+	multilinePreview = tview.NewTextView().
+		SetDynamicColors(true).
+		SetWordWrap(true)
+	multilinePreview.SetBorder(true).
+		SetTitle(" Multiline (Alt+Enter: newline, Enter: send, Esc: cancel) ").
+		SetBackgroundColor(tcell.ColorNames[config.Config.Colors.Background]).
+		SetBorderColor(tcell.ColorNames[config.Config.Colors.Borders])
+	multilinePreview.SetTextColor(tcell.ColorNames[config.Config.Colors.Text])
+}
+
+func updateInputLabel() {
+	if textInput == nil {
+		return
+	}
+	label := ""
+	if replyTargetMsg != nil {
+		rLabel := replyTargetMsg.ContactShort
+		if replyTargetMsg.FromMe {
+			rLabel = "Me"
+		}
+		if rLabel == "" {
+			rLabel = "message"
+		}
+		label = "Reply to " + rLabel
+	}
+	if len(draftLines) > 0 {
+		lineTag := fmt.Sprintf("[L%d]", len(draftLines)+1)
+		if label != "" {
+			label += " " + lineTag + ": "
+		} else {
+			label = lineTag + ": "
+		}
+	} else if label != "" {
+		label += ": "
+	}
+	textInput.SetLabel(label)
+}
+
+func clearDraftLines() {
+	draftLines = nil
+	updateInputLabel()
+}
+
+func drawOverlays(screen tcell.Screen) {
+	if textInput == nil {
+		return
+	}
+	ix, iy, iw, _ := textInput.GetRect()
+	bottomY := iy
+
+	if len(draftLines) > 0 && multilinePreview != nil && textInput.HasFocus() {
+		mh := len(draftLines) + 2
+		if mh > 10 {
+			mh = 10
+		}
+		my := bottomY - mh
+		if my < 0 {
+			mh = bottomY
+			my = 0
+		}
+		if mh >= 3 {
+			multilinePreview.SetText(tview.Escape(strings.Join(draftLines, "\n")))
+			multilinePreview.SetRect(ix, my, iw, mh)
+			multilinePreview.Draw(screen)
+			bottomY = my
+		}
+	}
+
+	if !emojiPickerVisible() {
+		return
+	}
+	lh := len(emojiPickerMatches) + 2
+	lw := 32
+	if iw > 0 && lw > iw {
+		lw = iw
+	}
+	ly := bottomY - lh
+	if ly < 0 {
+		ly = 0
+	}
+	emojiPicker.SetRect(ix, ly, lw, lh)
+	emojiPicker.Draw(screen)
+}
+
+func setupTextInput() {
 	textInput.SetBackgroundColor(tcell.ColorNames[config.Config.Colors.Background])
 	textInput.SetFieldBackgroundColor(tcell.ColorNames[config.Config.Colors.InputBackground])
 	textInput.SetFieldTextColor(tcell.ColorNames[config.Config.Colors.InputText])
 	textInput.SetChangedFunc(func(change string) {
+		if replaced := replaceEmojiShortcodes(change); replaced != change {
+			sndTxt = replaced
+			hideEmojiPicker()
+			emojiPickerDismissedQuery = ""
+			textInput.SetText(replaced)
+			syncScreen()
+			return
+		}
 		sndTxt = change
+		updateEmojiPicker(change)
 	})
 	textInput.SetDoneFunc(EnterCommand)
 	textInput.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		// Alt+Enter inserts a newline into draftLines instead of sending.
+		if event.Key() == tcell.KeyEnter && event.Modifiers()&tcell.ModAlt != 0 {
+			hideEmojiPicker()
+			emojiPickerDismissedQuery = ""
+			draftLines = append(draftLines, replaceEmojiShortcodes(sndTxt))
+			sndTxt = ""
+			textInput.SetText("")
+			updateInputLabel()
+			syncScreen()
+			return nil
+		}
+
+		// Plain Backspace on an empty line pops the previous draft line back for editing.
+		if (event.Key() == tcell.KeyBackspace || event.Key() == tcell.KeyBackspace2) &&
+			event.Modifiers() == tcell.ModNone && sndTxt == "" && len(draftLines) > 0 {
+			prev := draftLines[len(draftLines)-1]
+			draftLines = draftLines[:len(draftLines)-1]
+			sndTxt = prev
+			textInput.SetText(prev)
+			updateInputLabel()
+			syncScreen()
+			return nil
+		}
+
+		if emojiPickerVisible() {
+			switch event.Key() {
+			case tcell.KeyDown:
+				moveEmojiPicker(1)
+				return nil
+			case tcell.KeyUp:
+				moveEmojiPicker(-1)
+				return nil
+			case tcell.KeyEnter:
+				acceptEmojiPickerSelection()
+				return nil
+			case tcell.KeyEscape:
+				if _, q, ok := trailingEmojiQuery(sndTxt); ok {
+					emojiPickerDismissedQuery = q
+				}
+				hideEmojiPicker()
+				syncScreen()
+				return nil
+			}
+		}
+
+		// Typing QOL: Alt/Ctrl+Backspace deletes previous word; Ctrl+Left/Right jumps words.
+		if (event.Key() == tcell.KeyBackspace || event.Key() == tcell.KeyBackspace2) &&
+			(event.Modifiers()&(tcell.ModAlt|tcell.ModCtrl) != 0) {
+			return tcell.NewEventKey(tcell.KeyCtrlW, 0, tcell.ModNone)
+		}
+		if event.Key() == tcell.KeyLeft && event.Modifiers()&tcell.ModCtrl != 0 {
+			return tcell.NewEventKey(tcell.KeyLeft, 0, tcell.ModAlt)
+		}
+		if event.Key() == tcell.KeyRight && event.Modifiers()&tcell.ModCtrl != 0 {
+			return tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModAlt)
+		}
+
 		if event.Key() == tcell.KeyDown {
 			offset, _ := textView.GetScrollOffset()
 			offset += 1
@@ -153,21 +408,6 @@ func main() {
 		}
 		return event
 	})
-
-	gridLayout.AddItem(topBar, 0, 0, 1, 4, 0, 0, false)
-	gridLayout.AddItem(infoBar, 2, 0, 1, 1, 0, 0, false)
-	gridLayout.AddItem(MakeTree(), 1, 0, 1, 1, 0, 0, false)
-	gridLayout.AddItem(textView, 1, 1, 1, 3, 0, 0, false)
-	gridLayout.AddItem(textInput, 2, 1, 1, 3, 0, 0, false)
-
-	app.SetRoot(gridLayout, true)
-	app.EnableMouse(true)
-	app.SetFocus(textInput)
-	if err := sessionManager.StartManager(); err != nil {
-		PrintError(err)
-	}
-	LoadShortcuts()
-	app.Run()
 }
 
 // creates the TreeView for chats
@@ -259,6 +499,9 @@ func handleFocusContacts(ev *tcell.EventKey) *tcell.EventKey {
 }
 
 func handleSwitchPanels(ev *tcell.EventKey) *tcell.EventKey {
+	if acceptEmojiPickerSelection() {
+		return nil
+	}
 	ResetMsgSelection()
 	if !textInput.HasFocus() {
 		app.SetFocus(textInput)
@@ -334,9 +577,7 @@ func handleMessageCommand(command string) func(ev *tcell.EventKey) *tcell.EventK
 
 func clearReplyTarget() {
 	replyTargetMsg = nil
-	if textInput != nil {
-		textInput.SetLabel("")
-	}
+	updateInputLabel()
 }
 
 func handleReplyMessage(ev *tcell.EventKey) *tcell.EventKey {
@@ -348,14 +589,7 @@ func handleReplyMessage(ev *tcell.EventKey) *tcell.EventKey {
 		if val.Id == hls[0] {
 			msgCopy := val
 			replyTargetMsg = &msgCopy
-			label := msgCopy.ContactShort
-			if msgCopy.FromMe {
-				label = "Me"
-			}
-			if label == "" {
-				label = "message"
-			}
-			textInput.SetLabel("Reply to " + label + ": ")
+			updateInputLabel()
 			ResetMsgSelection()
 			if app != nil {
 				app.SetFocus(textInput)
@@ -600,6 +834,13 @@ func PrintHelp() {
 	fmt.Fprintln(textView, "[::b] Enter [::-] = Open chat")
 	fmt.Fprintln(textView, "[::b] / [::-] = Search chats (Esc to clear)")
 	fmt.Fprintln(textView, "")
+	fmt.Fprintln(textView, "[-::-]Input typing & Emoji[-::-]")
+	fmt.Fprintln(textView, "[::b] Alt+Enter [::-] = Insert newline (multiline message)")
+	fmt.Fprintln(textView, "[::b] Alt/Ctrl+Backspace [::-] = Delete word")
+	fmt.Fprintln(textView, "[::b] Ctrl+Left/Right [::-] = Jump word")
+	fmt.Fprintln(textView, "[::b] Ctrl+U / Ctrl+K [::-] = Clear line / kill to end")
+	fmt.Fprintln(textView, "[::b] :sob: or :so [::-] = Auto-replace or open emoji picker")
+	fmt.Fprintln(textView, "")
 	fmt.Fprintln(textView, "Config file in ->", config.GetConfigFilePath())
 	fmt.Fprintln(textView, "")
 	fmt.Fprintln(textView, "Type [::b]"+cmdPrefix+"commands[::-] to see all commands")
@@ -619,6 +860,7 @@ func PrintCommands() {
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"quit [::-]or[::b]", config.Config.Keymap.CommandQuit, "[::-] = Exit app")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"search[::-] [query]  = Search/filter chats (or press / in chat list)")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"archived[::-]  = Toggle Archived chats view")
+	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"emoji[::-] [query|refresh]  = Open emoji picker or refresh online handbook")
 	fmt.Fprintln(textView, "")
 	fmt.Fprintln(textView, "[-::-]Chat[-::-]")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"backlog [::-]or[::b]", config.Config.Keymap.CommandBacklog, "[::-] = load next", config.Config.General.BacklogMsgQuantity, "previous messages")
@@ -650,83 +892,126 @@ func EnterCommand(key tcell.Key) {
 	if key == tcell.KeyEsc {
 		textInput.SetText("")
 		clearReplyTarget()
+		clearDraftLines()
+		syncScreen()
 		return
 	}
-	if sndTxt == "" {
+	if len(draftLines) == 0 && sndTxt == "" {
 		return
 	}
 	cmdPrefix := config.Config.General.CmdPrefix
-	if sndTxt == cmdPrefix+"help" {
-		PrintHelp()
-		textInput.SetText("")
-		return
-	}
-	if sndTxt == cmdPrefix+"search" || strings.HasPrefix(sndTxt, cmdPrefix+"search ") {
-		query := strings.TrimSpace(strings.TrimPrefix(sndTxt, cmdPrefix+"search"))
-		chatSearchMode = true
-		chatSearchQuery = query
-		renderChats(allChats, chatSearchQuery)
-		app.SetFocus(treeView)
-		syncScreen()
-		textInput.SetText("")
-		return
-	}
-	if sndTxt == cmdPrefix+"archived" {
-		viewingArchived = !viewingArchived
-		renderChats(allChats, "")
-		if children := chatRoot.GetChildren(); len(children) > 0 {
-			treeView.SetCurrentNode(children[0])
-		} else {
-			treeView.SetCurrentNode(chatRoot)
+	if len(draftLines) == 0 {
+		if sndTxt == cmdPrefix+"help" {
+			PrintHelp()
+			textInput.SetText("")
+			return
 		}
-		app.SetFocus(treeView)
-		syncScreen()
-		textInput.SetText("")
-		return
-	}
-	if sndTxt == cmdPrefix+"commands" {
-		PrintCommands()
-		textInput.SetText("")
-		return
-	}
-	if sndTxt == cmdPrefix+"quit" {
-		sessionManager.CommandChannel <- messages.Command{"disconnect", nil}
-		app.Stop()
-		return
-	}
-	if strings.HasPrefix(sndTxt, cmdPrefix) {
-		cmd := strings.TrimPrefix(sndTxt, cmdPrefix)
-		var params []string
-		if strings.Index(cmd, " ") >= 0 {
-			cmdParts := strings.Split(cmd, " ")
-			cmd = cmdParts[0]
-			params = cmdParts[1:]
+		if sndTxt == cmdPrefix+"search" || strings.HasPrefix(sndTxt, cmdPrefix+"search ") {
+			query := strings.TrimSpace(strings.TrimPrefix(sndTxt, cmdPrefix+"search"))
+			chatSearchMode = true
+			chatSearchQuery = query
+			renderChats(allChats, chatSearchQuery)
+			app.SetFocus(treeView)
+			syncScreen()
+			textInput.SetText("")
+			return
 		}
-		sessionManager.CommandChannel <- messages.Command{cmd, params}
-		textInput.SetText("")
-		return
+		if sndTxt == cmdPrefix+"archived" {
+			viewingArchived = !viewingArchived
+			renderChats(allChats, "")
+			if children := chatRoot.GetChildren(); len(children) > 0 {
+				treeView.SetCurrentNode(children[0])
+			} else {
+				treeView.SetCurrentNode(chatRoot)
+			}
+			app.SetFocus(treeView)
+			syncScreen()
+			textInput.SetText("")
+			return
+		}
+		if sndTxt == cmdPrefix+"emoji" || strings.HasPrefix(sndTxt, cmdPrefix+"emoji ") {
+			query := strings.TrimSpace(strings.TrimPrefix(sndTxt, cmdPrefix+"emoji"))
+			if strings.EqualFold(query, "refresh") {
+				textInput.SetText("")
+				PrintText("Refreshing emoji handbook...")
+				go func() {
+					count, err := loadEmojiHandbook(true)
+					if err != nil {
+						PrintError(err)
+						return
+					}
+					PrintText(fmt.Sprintf("Loaded %d emoji shortcodes from online handbook", count))
+				}()
+				return
+			}
+			if query == "" {
+				query = "sm"
+			}
+			emojiPickerDismissedQuery = ""
+			textInput.SetText(":" + query)
+			if app != nil {
+				app.SetFocus(textInput)
+			}
+			syncScreen()
+			return
+		}
+		if sndTxt == cmdPrefix+"commands" {
+			PrintCommands()
+			textInput.SetText("")
+			return
+		}
+		if sndTxt == cmdPrefix+"quit" {
+			sessionManager.CommandChannel <- messages.Command{"disconnect", nil}
+			app.Stop()
+			return
+		}
+		if strings.HasPrefix(sndTxt, cmdPrefix) {
+			cmd := strings.TrimPrefix(sndTxt, cmdPrefix)
+			var params []string
+			if strings.Index(cmd, " ") >= 0 {
+				cmdParts := strings.Split(cmd, " ")
+				cmd = cmdParts[0]
+				params = cmdParts[1:]
+			}
+			sessionManager.CommandChannel <- messages.Command{cmd, params}
+			textInput.SetText("")
+			return
+		}
 	}
 	if currentReceiver.Id == "" {
 		PrintText("no receiver")
+		clearDraftLines()
 		textInput.SetText("")
+		syncScreen()
 		return
 	}
 	// no command, send as message (or reply if quoting)
+	fullText := sndTxt
+	if len(draftLines) > 0 {
+		if sndTxt != "" {
+			fullText = strings.Join(append(draftLines, sndTxt), "\n")
+		} else {
+			fullText = strings.Join(draftLines, "\n")
+		}
+	}
+	fullText = replaceEmojiShortcodes(fullText)
 	var msg messages.Command
 	if replyTargetMsg != nil {
 		msg = messages.Command{
 			Name:   "reply",
-			Params: []string{currentReceiver.Id, replyTargetMsg.Id, sndTxt},
+			Params: []string{currentReceiver.Id, replyTargetMsg.Id, fullText},
 		}
 		clearReplyTarget()
 	} else {
 		msg = messages.Command{
 			Name:   "send",
-			Params: []string{currentReceiver.Id, sndTxt},
+			Params: []string{currentReceiver.Id, fullText},
 		}
 	}
 	sessionManager.CommandChannel <- msg
+	clearDraftLines()
 	textInput.SetText("")
+	syncScreen()
 }
 
 // get the next message id to select (highlighted + offset)
@@ -933,6 +1218,7 @@ func attachTextViewMouseHandler() {
 func SetDisplayedChat(wid messages.Chat) {
 	//TODO: how to get chat to set
 	clearReplyTarget()
+	clearDraftLines()
 	expandedImages = make(map[string]bool)
 	currentReceiver = wid
 	textView.Clear()
@@ -956,10 +1242,17 @@ func getTextMessageString(msg *messages.Message) string {
 	colorMe := config.Config.Colors.ChatMe
 	colorContact := config.Config.Colors.ChatContact
 	out := ""
-	text := tview.Escape(msg.Text)
-	if msg.Forwarded {
-		text = "[" + config.Config.Colors.ForwardedText + "]" + text + "[-]"
+	barColor := colorContact
+	if msg.FromMe {
+		barColor = colorMe
 	}
+	lines := strings.Split(tview.Escape(msg.Text), "\n")
+	if msg.Forwarded {
+		for i, line := range lines {
+			lines[i] = "[" + config.Config.Colors.ForwardedText + "]" + line + "[-]"
+		}
+	}
+	text := strings.Join(lines, "\n["+barColor+"::d]  │ [-::-]")
 	tim := time.Unix(int64(msg.Timestamp), 0)
 	time := tim.Format("02-01-06 15:04:05")
 	out += "[\""
@@ -1067,8 +1360,22 @@ func renderChats(ids []messages.Chat, query string) {
 	} else {
 		chatRoot.SetText(title)
 	}
+	var prevChatID string
+	var prevNav archivedNavAction
+	if cur := treeView.GetCurrentNode(); cur != nil {
+		if ch, ok := cur.GetReference().(messages.Chat); ok {
+			prevChatID = ch.Id
+		} else if nav, ok := cur.GetReference().(archivedNavAction); ok {
+			prevNav = nav
+		}
+	}
+
 	chatRoot.ClearChildren()
 	oldId := currentReceiver.Id
+	targetChatID := prevChatID
+	if targetChatID == "" && prevNav == 0 {
+		targetChatID = oldId
+	}
 	q := strings.ToLower(query)
 
 	archivedCount := 0
@@ -1078,6 +1385,7 @@ func renderChats(ids []messages.Chat, query string) {
 		}
 	}
 
+	var restoredNode *tview.TreeNode
 	if q == "" {
 		if !viewingArchived && archivedCount > 0 {
 			archNode := tview.NewTreeNode(fmt.Sprintf("Archived (%d)", archivedCount)).
@@ -1085,12 +1393,18 @@ func renderChats(ids []messages.Chat, query string) {
 				SetSelectable(true).
 				SetColor(tcell.ColorNames[config.Config.Colors.ListHeader])
 			chatRoot.AddChild(archNode)
+			if prevNav == navOpenArchived {
+				restoredNode = archNode
+			}
 		} else if viewingArchived {
 			backNode := tview.NewTreeNode("<- Back to Chats").
 				SetReference(navBackToChats).
 				SetSelectable(true).
 				SetColor(tcell.ColorNames[config.Config.Colors.ListHeader])
 			chatRoot.AddChild(backNode)
+			if prevNav == navBackToChats {
+				restoredNode = backNode
+			}
 		}
 	}
 
@@ -1141,12 +1455,18 @@ func renderChats(ids []messages.Chat, query string) {
 		if firstMatch == nil {
 			firstMatch = node
 		}
-		if element.Id == currentReceiver.Id && q == "" {
-			treeView.SetCurrentNode(node)
+		if targetChatID != "" && element.Id == targetChatID {
+			restoredNode = node
 		}
 	}
-	if q != "" && firstMatch != nil {
-		treeView.SetCurrentNode(firstMatch)
+	if q != "" {
+		if restoredNode != nil {
+			treeView.SetCurrentNode(restoredNode)
+		} else if firstMatch != nil {
+			treeView.SetCurrentNode(firstMatch)
+		}
+	} else if restoredNode != nil {
+		treeView.SetCurrentNode(restoredNode)
 	}
 }
 

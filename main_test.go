@@ -21,11 +21,15 @@ func setupTestUI(t *testing.T) {
 	textView = tview.NewTextView().SetDynamicColors(true).SetRegions(true)
 	attachTextViewMouseHandler()
 	textInput = tview.NewInputField()
+	initEmojiPicker()
+	initMultilinePreview()
+	setupTextInput()
 	sessionManager = &messages.SessionManager{
 		CommandChannel: make(chan messages.Command, 16),
 	}
 	currentReceiver = messages.Chat{}
 	expandedImages = make(map[string]bool)
+	draftLines = nil
 	treeView = MakeTree()
 	LoadShortcuts()
 
@@ -255,5 +259,135 @@ func TestDoubleClickTogglesExpandedImage(t *testing.T) {
 	capture(tview.MouseLeftDoubleClick, tcell.NewEventMouse(10, 5, tcell.Button1, tcell.ModNone))
 	if expandedImages["img-99"] {
 		t.Fatalf("expected img-99 to collapse on second double-click")
+	}
+}
+
+func TestRenderChatsPreservesCursorPosition(t *testing.T) {
+	setupTestUI(t)
+	currentReceiver = messages.Chat{Id: "111@s.whatsapp.net", Name: "Alice"}
+
+	// Hover over Work Group without pressing Enter
+	children := chatRoot.GetChildren()
+	treeView.SetCurrentNode(children[2])
+
+	// Prepend a new chat at the top (simulating incoming message refresh)
+	updated := append([]messages.Chat{{Id: "000@s.whatsapp.net", Name: "New Message"}}, allChats...)
+	renderChats(updated, "")
+
+	cur := treeView.GetCurrentNode()
+	if cur == nil {
+		t.Fatalf("expected non-nil current node after refresh")
+	}
+	ch, ok := cur.GetReference().(messages.Chat)
+	if !ok || ch.Id != "333@g.us" {
+		t.Fatalf("expected cursor preserved on Work Group (333@g.us), got %+v", cur.GetReference())
+	}
+}
+
+func TestInputTypingQOLAltAndCtrlBackspace(t *testing.T) {
+	setupTestUI(t)
+	textInput.SetText("hello world test")
+
+	capture := textInput.GetInputCapture()
+	ih := textInput.InputHandler()
+	noopFocus := func(p tview.Primitive) {}
+
+	if ev := capture(tcell.NewEventKey(tcell.KeyBackspace2, 0, tcell.ModAlt)); ev != nil {
+		ih(ev, noopFocus)
+	}
+	if got := textInput.GetText(); got != "hello world " {
+		t.Fatalf("expected 'hello world ' after Alt+Backspace, got %q", got)
+	}
+
+	if ev := capture(tcell.NewEventKey(tcell.KeyBackspace, 0, tcell.ModCtrl)); ev != nil {
+		ih(ev, noopFocus)
+	}
+	if got := textInput.GetText(); got != "hello " {
+		t.Fatalf("expected 'hello ' after Ctrl+Backspace, got %q", got)
+	}
+}
+
+func TestEmojiPickerAndShortcodeReplacement(t *testing.T) {
+	setupTestUI(t)
+	emojiPickerDismissedQuery = ""
+
+	// Direct shortcode auto-replacement
+	textInput.SetText("bro :sob:")
+	if got := textInput.GetText(); got != "bro 😭" {
+		t.Fatalf("expected 'bro 😭', got %q", got)
+	}
+
+	// Picker opens for trailing :so when textInput is focused
+	textInput.Focus(func(p tview.Primitive) {})
+	textInput.SetText("bro :so")
+	if !emojiPickerVisible() {
+		t.Fatalf("expected emoji picker visible for 'bro :so'")
+	}
+	if len(emojiPickerMatches) == 0 || emojiPickerMatches[0].Code != "sob" {
+		t.Fatalf("expected 'sob' first in picker, got %+v", emojiPickerMatches)
+	}
+	if !acceptEmojiPickerSelection() {
+		t.Fatalf("expected acceptEmojiPickerSelection to return true")
+	}
+	if got := textInput.GetText(); got != "bro 😭 " {
+		t.Fatalf("expected 'bro 😭 ' after accepting picker, got %q", got)
+	}
+	if emojiPickerVisible() {
+		t.Fatalf("expected emoji picker closed after selection")
+	}
+}
+
+func TestMultilineAltEnterSendAndBackspace(t *testing.T) {
+	setupTestUI(t)
+	currentReceiver = messages.Chat{Id: "111@s.whatsapp.net", Name: "Alice"}
+	capture := textInput.GetInputCapture()
+
+	textInput.SetText("line one")
+	if ev := capture(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModAlt)); ev != nil {
+		t.Fatalf("expected Alt+Enter to be consumed")
+	}
+	if len(draftLines) != 1 || draftLines[0] != "line one" {
+		t.Fatalf("expected draftLines=['line one'], got %+v", draftLines)
+	}
+	if got := textInput.GetText(); got != "" {
+		t.Fatalf("expected empty textInput after Alt+Enter, got %q", got)
+	}
+
+	// Plain Backspace on empty line restores previous draft line
+	if ev := capture(tcell.NewEventKey(tcell.KeyBackspace2, 0, tcell.ModNone)); ev != nil {
+		t.Fatalf("expected Backspace on empty draft line to be consumed")
+	}
+	if len(draftLines) != 0 || textInput.GetText() != "line one" {
+		t.Fatalf("expected draftLines empty and textInput 'line one', got lines=%+v text=%q", draftLines, textInput.GetText())
+	}
+
+	// Queue line one again, add line two with emoji, and send with Enter
+	capture(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModAlt))
+	textInput.SetText("line two :fire:")
+	EnterCommand(tcell.KeyEnter)
+
+	if len(draftLines) != 0 {
+		t.Fatalf("expected draftLines cleared after send, got %+v", draftLines)
+	}
+	select {
+	case cmd := <-sessionManager.CommandChannel:
+		if cmd.Name != "send" || len(cmd.Params) != 2 || cmd.Params[1] != "line one\nline two 🔥" {
+			t.Fatalf("unexpected multiline send command: %+v", cmd)
+		}
+	default:
+		t.Fatalf("expected send command on CommandChannel")
+	}
+}
+
+func TestGetTextMessageStringFormatsMultiline(t *testing.T) {
+	msg := &messages.Message{
+		Id:        "ml-1",
+		FromMe:    true,
+		Timestamp: 1700000000,
+		Text:      "line one\nline two\n\nline four",
+	}
+	got := getTextMessageString(msg)
+	if !strings.Contains(got, "line one\n[") || !strings.Contains(got, "  │ [-::-]line two") || !strings.Contains(got, "  │ [-::-]line four") {
+		t.Fatalf("expected multiline continuation bars, got %q", got)
 	}
 }
