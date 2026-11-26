@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +22,7 @@ import (
 	"github.com/normen/whatscli/qrcode"
 	"github.com/rivo/tview"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -48,6 +51,7 @@ type SessionManager struct {
 	started         bool
 	eventHandler    *eventHandler
 	Logger          waLog.Logger
+	PairPhone       string
 	lidResolver     func(types.JID) (types.JID, error)
 }
 
@@ -160,15 +164,31 @@ func (sm *SessionManager) runManager() error {
 	if sm.client != nil {
 		sm.client.Disconnect()
 	}
+	_ = sm.db.Close()
 	return nil
 }
 
 func (sm *SessionManager) setCurrentReceiver(id string) {
 	sm.currentReceiver = id
-	sm.uiHandler.NewScreen(sm.getMessages(id))
+	msgs := sm.getMessages(id)
+	sm.uiHandler.NewScreen(msgs)
+	if config.Config.General.AutoMarkRead && id != "" && sm.db.GetChatUnread(id) > 0 {
+		sm.markCurrentChatReadInternal(true)
+	}
+	if config.Config.General.InlineImages && id != "" {
+		go sm.prefetchChatStickers(msgs, 5)
+	}
 }
 
 func (sm *SessionManager) getConnection() (*whatsmeow.Client, error) {
+	if sm.db.sqlDB == nil {
+		msgDBPath := config.GetSessionFilePath() + ".messages.db"
+		if err := sm.db.OpenSQLite(msgDBPath); err != nil {
+			sm.log().Warnf("failed to open messages db %s: %v", msgDBPath, err)
+		} else if chats := sm.db.GetChatIds(); len(chats) > 0 {
+			sm.uiHandler.SetChats(chats)
+		}
+	}
 	if sm.client == nil {
 		dbPath := config.GetSessionFilePath() + ".db"
 		container, err := sqlstore.New(context.Background(), "sqlite3", "file:"+dbPath+"?_foreign_keys=on", sm.log().Sub("DB"))
@@ -205,6 +225,9 @@ func (sm *SessionManager) loginWithConnection(client *whatsmeow.Client) error {
 	}
 
 	if client.Store.ID == nil {
+		if sm.PairPhone != "" {
+			return sm.loginWithPairPhone(client, sm.PairPhone)
+		}
 		return sm.loginWithQRCode(client)
 	}
 
@@ -258,6 +281,32 @@ func (sm *SessionManager) loginWithQRCode(client *whatsmeow.Client) error {
 	return errors.New("QR code channel closed without success")
 }
 
+func (sm *SessionManager) loginWithPairPhone(client *whatsmeow.Client, phone string) error {
+	sm.uiHandler.PrintText("Requesting pairing code for " + phone + "...")
+	if err := client.Connect(); err != nil {
+		return fmt.Errorf("error connecting to WhatsApp: %v", err)
+	}
+	time.Sleep(1 * time.Second)
+
+	code, err := client.PairPhone(context.Background(), phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	if err != nil {
+		return fmt.Errorf("failed to request pairing code: %v", err)
+	}
+	sm.uiHandler.PrintText("Pairing code: [::b]" + code + "[::-] (WhatsApp -> Linked Devices -> Link with phone number)")
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for sm.started && time.Now().Before(deadline) {
+		if client.Store.ID != nil {
+			sm.uiHandler.PrintText("Successfully paired with phone number!")
+			sm.StatusChannel <- StatusMsg{true, nil}
+			go sm.loadRecentChats()
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return errors.New("phone pairing timed out")
+}
+
 func (sm *SessionManager) loadRecentChats() {
 	if sm.client == nil || !sm.client.IsConnected() {
 		sm.uiHandler.PrintError(errors.New("not connected to WhatsApp"))
@@ -276,12 +325,14 @@ func (sm *SessionManager) loadRecentChats() {
 				if jid.Server != types.DefaultUserServer {
 					continue
 				}
+				// Only add saved address-book contacts to the chat list (#139);
+				// unsaved group-member contacts remain in db.contacts for name resolution.
+				if contact.FullName == "" && contact.FirstName == "" {
+					continue
+				}
 				name := contact.FullName
 				if name == "" {
-					name = contact.PushName
-				}
-				if name == "" {
-					name = jid.User
+					name = contact.FirstName
 				}
 				sm.db.AddChat(Chat{
 					Id:      jid.String(),
@@ -309,11 +360,42 @@ func (sm *SessionManager) loadRecentChats() {
 		}
 	}
 
+	for _, ch := range sm.db.GetChatIds() {
+		sm.applyStoredChatSettings(ch.Id)
+	}
+
 	sm.log().Infof("loadRecentChats: addedChats=%d groups=%d", addedChats, groupCount)
 	sm.uiHandler.SetChats(sm.db.GetChatIds())
 	if addedChats > 0 {
 		sm.uiHandler.PrintText(fmt.Sprintf("Loaded %d chats", addedChats))
 	}
+}
+
+func (sm *SessionManager) applyStoredChatSettings(chatID string) {
+	if sm.client == nil || sm.client.Store == nil || sm.client.Store.ChatSettings == nil {
+		return
+	}
+	jid, err := types.ParseJID(chatID)
+	if err != nil {
+		return
+	}
+	settings, err := sm.client.Store.ChatSettings.GetChatSettings(context.Background(), jid)
+	if err != nil || !settings.Found {
+		if altJID, altErr := sm.client.Store.GetAltJID(context.Background(), jid); altErr == nil && !altJID.IsEmpty() {
+			if altSettings, sErr := sm.client.Store.ChatSettings.GetChatSettings(context.Background(), altJID); sErr == nil && altSettings.Found {
+				settings = altSettings
+				err = nil
+			}
+		}
+	}
+	if err != nil || !settings.Found {
+		return
+	}
+	var muted int64
+	if !settings.MutedUntil.IsZero() {
+		muted = settings.MutedUntil.Unix()
+	}
+	sm.db.SetChatSettings(chatID, &settings.Archived, &settings.Pinned, &muted)
 }
 
 func (sm *SessionManager) loadContacts() {
@@ -417,6 +499,8 @@ func (sm *SessionManager) logout() error {
 	}
 	sm.client = nil
 	sm.container = nil
+	sm.db.ClearAll()
+	sm.uiHandler.SetChats(sm.db.GetChatIds())
 	sm.StatusChannel <- StatusMsg{false, nil}
 	sm.uiHandler.PrintText("Successfully logged out")
 	return nil
@@ -448,6 +532,12 @@ func (sm *SessionManager) execCommand(command Command) {
 		} else {
 			sm.printCommandUsage("send", "[chat-id[] [message text[]")
 		}
+	case "reply":
+		if checkParam(command.Params, 3) {
+			sm.sendReply(command.Params[0], command.Params[1], strings.Join(command.Params[2:], " "))
+		} else {
+			sm.printCommandUsage("reply", "[chat-id[] [msg-id[] [message text[]")
+		}
 	case "select":
 		if checkParam(command.Params, 1) {
 			sm.setCurrentReceiver(command.Params[0])
@@ -456,6 +546,18 @@ func (sm *SessionManager) execCommand(command Command) {
 		}
 	case "read":
 		sm.markCurrentChatRead()
+	case "archive":
+		sm.setChatArchive(true)
+	case "unarchive":
+		sm.setChatArchive(false)
+	case "pin":
+		sm.setChatPin(true)
+	case "unpin":
+		sm.setChatPin(false)
+	case "mute":
+		sm.setChatMute(true, command.Params)
+	case "unmute":
+		sm.setChatMute(false, nil)
 	case "info":
 		if checkParam(command.Params, 1) {
 			sm.uiHandler.PrintText(sm.db.GetMessageInfo(command.Params[0]))
@@ -468,6 +570,8 @@ func (sm *SessionManager) execCommand(command Command) {
 		sm.downloadCommand(command.Params, true, false)
 	case "show":
 		sm.downloadCommand(command.Params, true, true)
+	case "preview":
+		sm.previewCommand(command.Params)
 	case "url":
 		sm.openMessageURL(command.Params)
 	case "upload":
@@ -585,6 +689,8 @@ func (sm *SessionManager) resetSession() {
 
 	sm.client = nil
 	sm.container = nil
+	sm.db.ClearAll()
+	sm.uiHandler.SetChats(sm.db.GetChatIds())
 	dbPath := config.GetSessionFilePath() + ".db"
 	if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
 		sm.uiHandler.PrintText("Warning: Couldn't remove database file: " + err.Error())
@@ -594,25 +700,37 @@ func (sm *SessionManager) resetSession() {
 }
 
 func (sm *SessionManager) markCurrentChatRead() {
+	sm.markCurrentChatReadInternal(false)
+}
+
+func (sm *SessionManager) markCurrentChatReadInternal(quiet bool) {
 	if sm.currentReceiver == "" {
-		sm.printCommandUsage("read", "-> only works in a chat")
+		if !quiet {
+			sm.printCommandUsage("read", "-> only works in a chat")
+		}
 		return
 	}
 	if sm.client == nil || !sm.client.IsConnected() {
-		sm.uiHandler.PrintError(errors.New("not connected to WhatsApp"))
+		if !quiet {
+			sm.uiHandler.PrintError(errors.New("not connected to WhatsApp"))
+		}
 		return
 	}
 
 	chatJID, err := types.ParseJID(sm.currentReceiver)
 	if err != nil {
-		sm.uiHandler.PrintError(fmt.Errorf("invalid JID: %v", err))
+		if !quiet {
+			sm.uiHandler.PrintError(fmt.Errorf("invalid JID: %v", err))
+		}
 		return
 	}
 
 	unreadMessages := sm.db.MarkChatRead(sm.currentReceiver)
 	if len(unreadMessages) == 0 {
 		sm.uiHandler.SetChats(sm.db.GetChatIds())
-		sm.uiHandler.PrintText("No unread messages in current chat")
+		if !quiet {
+			sm.uiHandler.PrintText("No unread messages in current chat")
+		}
 		return
 	}
 
@@ -670,8 +788,8 @@ func (sm *SessionManager) downloadCommand(params []string, preview, show bool) {
 		sm.uiHandler.PrintError(errors.New("message not found"))
 		return
 	}
-	if show && msg.Kind != MessageKindImage {
-		sm.uiHandler.PrintError(errors.New("show only works for image messages"))
+	if show && msg.Kind != MessageKindImage && msg.Kind != MessageKindSticker {
+		sm.uiHandler.PrintError(errors.New("show only works for image and sticker messages"))
 		return
 	}
 
@@ -689,6 +807,28 @@ func (sm *SessionManager) downloadCommand(params []string, preview, show bool) {
 		return
 	}
 	sm.uiHandler.PrintText("[::d] -> " + path + "[::-]")
+}
+
+func (sm *SessionManager) previewCommand(params []string) {
+	if !checkParam(params, 1) {
+		return
+	}
+	msg, ok := sm.db.GetMessage(params[0])
+	if !ok {
+		return
+	}
+	if msg.Kind != MessageKindImage && msg.Kind != MessageKindSticker {
+		return
+	}
+	go func() {
+		if _, err := sm.downloadMessage(msg, true); err != nil {
+			sm.uiHandler.PrintError(err)
+			return
+		}
+		if sm.currentReceiver == msg.ChatId {
+			sm.uiHandler.NewScreen(sm.getMessages(msg.ChatId))
+		}
+	}()
 }
 
 func (sm *SessionManager) openMessageURL(params []string) {
@@ -718,8 +858,43 @@ func (sm *SessionManager) sendMediaCommand(params []string, kind MessageKind) {
 		sm.printCommandUsage(commandNameForKind(kind), "/path/to/file")
 		return
 	}
-	path := strings.Join(params, " ")
+	path := normalizeUploadPath(strings.Join(params, " "))
 	sm.uiHandler.PrintError(sm.sendMedia(sm.currentReceiver, path, kind))
+}
+
+func normalizeUploadPath(raw string) string {
+	p := strings.TrimSpace(raw)
+	if len(p) >= 2 && ((p[0] == '"' && p[len(p)-1] == '"') || (p[0] == '\'' && p[len(p)-1] == '\'')) {
+		p = p[1 : len(p)-1]
+	}
+	if strings.HasPrefix(p, "file://") {
+		p = strings.TrimPrefix(p, "file://")
+		if unescaped, err := url.PathUnescape(p); err == nil {
+			p = unescaped
+		}
+	}
+	if strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = filepath.Join(home, p[2:])
+		}
+	}
+	if _, err := os.Stat(p); err != nil && strings.Contains(p, `\`) {
+		replacer := strings.NewReplacer(
+			`\ `, " ",
+			`\'`, "'",
+			`\"`, `"`,
+			`\(`, "(",
+			`\)`, ")",
+			`\[`, "[",
+			`\]`, "]",
+			`\&`, "&",
+		)
+		unescaped := replacer.Replace(p)
+		if _, err2 := os.Stat(unescaped); err2 == nil {
+			return unescaped
+		}
+	}
+	return p
 }
 
 func (sm *SessionManager) revokeMessage(params []string) {
@@ -911,11 +1086,185 @@ func (sm *SessionManager) sendText(wid, text string) {
 	sm.uiHandler.SetChats(sm.db.GetChatIds())
 }
 
+func (sm *SessionManager) setChatArchive(archive bool) {
+	if sm.currentReceiver == "" {
+		sm.printCommandUsage("archive", "-> only works in a chat")
+		return
+	}
+	if sm.client == nil || !sm.client.IsConnected() {
+		sm.uiHandler.PrintError(errors.New("not connected to WhatsApp"))
+		return
+	}
+	jid, err := types.ParseJID(sm.currentReceiver)
+	if err != nil {
+		sm.uiHandler.PrintError(fmt.Errorf("invalid JID: %v", err))
+		return
+	}
+	patch := appstate.BuildArchive(jid, archive, time.Time{}, nil)
+	if err := sm.client.SendAppState(context.Background(), patch); err != nil {
+		sm.uiHandler.PrintError(fmt.Errorf("failed to update archive state: %v", err))
+		return
+	}
+	sm.db.SetChatSettings(sm.currentReceiver, &archive, nil, nil)
+	sm.uiHandler.SetChats(sm.db.GetChatIds())
+	if archive {
+		sm.uiHandler.PrintText("Chat archived")
+	} else {
+		sm.uiHandler.PrintText("Chat unarchived")
+	}
+}
+
+func (sm *SessionManager) setChatPin(pin bool) {
+	if sm.currentReceiver == "" {
+		sm.printCommandUsage("pin", "-> only works in a chat")
+		return
+	}
+	if sm.client == nil || !sm.client.IsConnected() {
+		sm.uiHandler.PrintError(errors.New("not connected to WhatsApp"))
+		return
+	}
+	jid, err := types.ParseJID(sm.currentReceiver)
+	if err != nil {
+		sm.uiHandler.PrintError(fmt.Errorf("invalid JID: %v", err))
+		return
+	}
+	patch := appstate.BuildPin(jid, pin)
+	if err := sm.client.SendAppState(context.Background(), patch); err != nil {
+		sm.uiHandler.PrintError(fmt.Errorf("failed to update pin state: %v", err))
+		return
+	}
+	sm.db.SetChatSettings(sm.currentReceiver, nil, &pin, nil)
+	sm.uiHandler.SetChats(sm.db.GetChatIds())
+	if pin {
+		sm.uiHandler.PrintText("Chat pinned")
+	} else {
+		sm.uiHandler.PrintText("Chat unpinned")
+	}
+}
+
+func (sm *SessionManager) setChatMute(mute bool, params []string) {
+	if sm.currentReceiver == "" {
+		sm.printCommandUsage("mute", "-> only works in a chat")
+		return
+	}
+	if sm.client == nil || !sm.client.IsConnected() {
+		sm.uiHandler.PrintError(errors.New("not connected to WhatsApp"))
+		return
+	}
+	jid, err := types.ParseJID(sm.currentReceiver)
+	if err != nil {
+		sm.uiHandler.PrintError(fmt.Errorf("invalid JID: %v", err))
+		return
+	}
+
+	var duration time.Duration
+	var mutedUntil int64
+	if mute {
+		duration = 8 * time.Hour
+		if len(params) > 0 {
+			arg := strings.ToLower(strings.TrimSpace(params[0]))
+			if arg == "0" || arg == "forever" {
+				duration = 0
+			} else if hrs, convErr := strconv.Atoi(arg); convErr == nil && hrs > 0 {
+				duration = time.Duration(hrs) * time.Hour
+			} else {
+				sm.printCommandUsage("mute", "[hours|forever]")
+				return
+			}
+		}
+		if duration == 0 {
+			mutedUntil = -1
+		} else {
+			mutedUntil = time.Now().Add(duration).Unix()
+		}
+	}
+
+	patch := appstate.BuildMute(jid, mute, duration)
+	if err := sm.client.SendAppState(context.Background(), patch); err != nil {
+		sm.uiHandler.PrintError(fmt.Errorf("failed to update mute state: %v", err))
+		return
+	}
+	sm.db.SetChatSettings(sm.currentReceiver, nil, nil, &mutedUntil)
+	sm.uiHandler.SetChats(sm.db.GetChatIds())
+	if !mute {
+		sm.uiHandler.PrintText("Chat unmuted")
+	} else if mutedUntil == -1 {
+		sm.uiHandler.PrintText("Chat muted forever")
+	} else {
+		sm.uiHandler.PrintText(fmt.Sprintf("Chat muted for %d hours", int(duration.Hours())))
+	}
+}
+
+func (sm *SessionManager) sendReply(wid, quotedMsgID, text string) {
+	if sm.client == nil || !sm.client.IsConnected() {
+		sm.uiHandler.PrintError(errors.New("not connected to WhatsApp"))
+		return
+	}
+	receiver, err := types.ParseJID(wid)
+	if err != nil {
+		sm.uiHandler.PrintError(fmt.Errorf("invalid JID: %v", err))
+		return
+	}
+	quoted, ok := sm.db.GetMessage(quotedMsgID)
+	if !ok {
+		sm.uiHandler.PrintError(errors.New("quoted message not found"))
+		return
+	}
+
+	quotedProto := quoted.RawMessage
+	if quotedProto == nil {
+		quotedProto = &waProto.Message{Conversation: proto.String(quoted.Text)}
+	}
+
+	participant := quoted.SenderId
+	if quoted.FromMe {
+		if sm.client.Store != nil && sm.client.Store.ID != nil {
+			participant = sm.client.Store.ID.ToNonAD().String()
+		}
+	} else if participant == "" {
+		participant = wid
+	}
+
+	raw := &waProto.Message{
+		ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text: proto.String(text),
+			ContextInfo: &waProto.ContextInfo{
+				StanzaID:      proto.String(quoted.Id),
+				Participant:   proto.String(participant),
+				QuotedMessage: quotedProto,
+			},
+		},
+	}
+
+	sm.lastSent = time.Now()
+	resp, err := sm.client.SendMessage(context.Background(), receiver, raw)
+	if err != nil {
+		sm.uiHandler.PrintError(fmt.Errorf("failed to send reply: %v", err))
+		return
+	}
+
+	newMsg := sm.outgoingMessageFromSendResponse(resp, wid, raw, MessageKindText, text, "", "")
+	newMsg.QuotedId = quoted.Id
+	if quoted.FromMe {
+		newMsg.QuotedSender = "Me"
+	} else {
+		newMsg.QuotedSender = quoted.ContactShort
+	}
+	newMsg.QuotedText = quoted.Text
+
+	sm.db.AddMessage(newMsg, false)
+	if sm.currentReceiver == wid {
+		sm.uiHandler.NewMessage(newMsg)
+	}
+	sm.uiHandler.SetChats(sm.db.GetChatIds())
+}
+
 func (sm *SessionManager) sendMedia(chatID, path string, kind MessageKind) error {
 	if sm.client == nil || !sm.client.IsConnected() {
 		return errors.New("not connected to WhatsApp")
 	}
 
+	path = normalizeUploadPath(path)
 	data, mimeType, fileName, err := readUploadFile(path)
 	if err != nil {
 		return err
@@ -989,6 +1338,11 @@ func (sm *SessionManager) sendMedia(chatID, path string, kind MessageKind) error
 
 	text := mediaDisplayText(kind, fileName, "")
 	newMsg := sm.outgoingMessageFromSendResponse(resp, chatID, raw, kind, text, mimeType, fileName)
+	if kind == MessageKindImage && config.Config.General.InlineImages {
+		if mkErr := os.MkdirAll(config.Config.General.PreviewPath, 0o755); mkErr == nil {
+			_ = os.WriteFile(filepath.Join(config.Config.General.PreviewPath, DownloadFileName(newMsg)), data, 0o644)
+		}
+	}
 	sm.db.AddMessage(newMsg, false)
 	if sm.currentReceiver == chatID {
 		sm.uiHandler.NewMessage(newMsg)
@@ -1056,6 +1410,43 @@ func (eh *eventHandler) Handle(evt interface{}) {
 		eh.sm.log().Infof("event.OfflineSyncCompleted: count=%d", v.Count)
 	case *events.AppStateSyncComplete:
 		eh.sm.log().Infof("event.AppStateSyncComplete: name=%v", v.Name)
+	case *events.Archive:
+		if v.Action != nil {
+			chatID := eh.sm.normalizeJID(v.JID).String()
+			archived := v.Action.GetArchived()
+			eh.sm.db.SetChatSettings(chatID, &archived, nil, nil)
+			eh.sm.uiHandler.SetChats(eh.sm.db.GetChatIds())
+		}
+	case *events.Pin:
+		if v.Action != nil {
+			chatID := eh.sm.normalizeJID(v.JID).String()
+			pinned := v.Action.GetPinned()
+			eh.sm.db.SetChatSettings(chatID, nil, &pinned, nil)
+			eh.sm.uiHandler.SetChats(eh.sm.db.GetChatIds())
+		}
+	case *events.Mute:
+		if v.Action != nil {
+			chatID := eh.sm.normalizeJID(v.JID).String()
+			var mutedUntil int64
+			if v.Action.GetMuted() {
+				ts := v.Action.GetMuteEndTimestamp()
+				if ts <= 0 {
+					mutedUntil = -1
+				} else if ts > 1e12 {
+					mutedUntil = ts / 1000
+				} else {
+					mutedUntil = ts
+				}
+			}
+			eh.sm.db.SetChatSettings(chatID, nil, nil, &mutedUntil)
+			eh.sm.uiHandler.SetChats(eh.sm.db.GetChatIds())
+		}
+	case *events.MarkChatAsRead:
+		if v.Action != nil && v.Action.GetRead() {
+			chatID := eh.sm.normalizeJID(v.JID).String()
+			eh.sm.db.MarkChatRead(chatID)
+			eh.sm.uiHandler.SetChats(eh.sm.db.GetChatIds())
+		}
 	case *events.Connected:
 		eh.sm.StatusChannel <- StatusMsg{true, nil}
 	case *events.Disconnected:
@@ -1091,10 +1482,13 @@ func (eh *eventHandler) handleLiveMessage(evt *events.Message) {
 		} else {
 			eh.sm.uiHandler.NewScreen(eh.sm.getMessages(msg.ChatId))
 		}
-	} else if markUnread && msg.Timestamp > uint64(time.Now().Unix()-30) {
+	} else if markUnread && msg.Timestamp > uint64(time.Now().Unix()-30) && !eh.sm.db.IsChatMuted(msg.ChatId) {
 		if err := notify(msg.ContactShort, msg.Text); err != nil {
 			eh.sm.uiHandler.PrintError(err)
 		}
+	}
+	if msg.Kind == MessageKindSticker {
+		go eh.sm.prefetchStickerPreview(msg)
 	}
 	eh.sm.uiHandler.SetChats(eh.sm.db.GetChatIds())
 }
@@ -1260,6 +1654,7 @@ func (eh *eventHandler) messageFromInfo(info types.MessageInfo, raw *waProto.Mes
 		msg.Kind = MessageKindText
 		msg.Text = ext.GetText()
 		msg.Forwarded = ext.GetContextInfo().GetIsForwarded()
+		msg.QuotedId, msg.QuotedSender, msg.QuotedText = eh.extractQuoteFromContext(ext.GetContextInfo())
 		return msg, true
 	case raw.GetImageMessage() != nil:
 		image := raw.GetImageMessage()
@@ -1267,6 +1662,7 @@ func (eh *eventHandler) messageFromInfo(info types.MessageInfo, raw *waProto.Mes
 		msg.MimeType = image.GetMimetype()
 		msg.Text = mediaDisplayText(MessageKindImage, "", image.GetCaption())
 		msg.Forwarded = image.GetContextInfo().GetIsForwarded()
+		msg.QuotedId, msg.QuotedSender, msg.QuotedText = eh.extractQuoteFromContext(image.GetContextInfo())
 		return msg, true
 	case raw.GetVideoMessage() != nil:
 		video := raw.GetVideoMessage()
@@ -1274,6 +1670,7 @@ func (eh *eventHandler) messageFromInfo(info types.MessageInfo, raw *waProto.Mes
 		msg.MimeType = video.GetMimetype()
 		msg.Text = mediaDisplayText(MessageKindVideo, "", video.GetCaption())
 		msg.Forwarded = video.GetContextInfo().GetIsForwarded()
+		msg.QuotedId, msg.QuotedSender, msg.QuotedText = eh.extractQuoteFromContext(video.GetContextInfo())
 		return msg, true
 	case raw.GetAudioMessage() != nil:
 		audio := raw.GetAudioMessage()
@@ -1281,6 +1678,7 @@ func (eh *eventHandler) messageFromInfo(info types.MessageInfo, raw *waProto.Mes
 		msg.MimeType = audio.GetMimetype()
 		msg.Text = mediaDisplayText(MessageKindAudio, "", "")
 		msg.Forwarded = audio.GetContextInfo().GetIsForwarded()
+		msg.QuotedId, msg.QuotedSender, msg.QuotedText = eh.extractQuoteFromContext(audio.GetContextInfo())
 		return msg, true
 	case raw.GetDocumentMessage() != nil:
 		doc := raw.GetDocumentMessage()
@@ -1289,10 +1687,62 @@ func (eh *eventHandler) messageFromInfo(info types.MessageInfo, raw *waProto.Mes
 		msg.FileName = doc.GetFileName()
 		msg.Text = mediaDisplayText(MessageKindDocument, doc.GetFileName(), doc.GetCaption())
 		msg.Forwarded = doc.GetContextInfo().GetIsForwarded()
+		msg.QuotedId, msg.QuotedSender, msg.QuotedText = eh.extractQuoteFromContext(doc.GetContextInfo())
+		return msg, true
+	case raw.GetStickerMessage() != nil:
+		sticker := raw.GetStickerMessage()
+		msg.Kind = MessageKindSticker
+		msg.MimeType = sticker.GetMimetype()
+		msg.Text = mediaDisplayText(MessageKindSticker, "", "")
+		msg.Forwarded = sticker.GetContextInfo().GetIsForwarded()
+		msg.QuotedId, msg.QuotedSender, msg.QuotedText = eh.extractQuoteFromContext(sticker.GetContextInfo())
 		return msg, true
 	default:
 		return Message{}, false
 	}
+}
+
+func (eh *eventHandler) extractQuoteFromContext(ctxInfo *waProto.ContextInfo) (string, string, string) {
+	if ctxInfo == nil || ctxInfo.GetStanzaID() == "" {
+		return "", "", ""
+	}
+	quotedID := ctxInfo.GetStanzaID()
+	quotedSender := ""
+	if p := ctxInfo.GetParticipant(); p != "" {
+		if pJID, err := types.ParseJID(p); err == nil {
+			pJID = eh.sm.normalizeJID(pJID)
+			if eh.sm.client != nil && eh.sm.client.Store != nil && eh.sm.client.Store.ID != nil &&
+				pJID.User == eh.sm.client.Store.ID.User {
+				quotedSender = "Me"
+			} else {
+				quotedSender = eh.getContactShort(pJID)
+			}
+		} else {
+			quotedSender = p
+		}
+	}
+
+	quotedText := ""
+	if qm := ctxInfo.GetQuotedMessage(); qm != nil {
+		switch {
+		case qm.GetConversation() != "":
+			quotedText = qm.GetConversation()
+		case qm.GetExtendedTextMessage() != nil:
+			quotedText = qm.GetExtendedTextMessage().GetText()
+		case qm.GetImageMessage() != nil:
+			quotedText = mediaDisplayText(MessageKindImage, "", qm.GetImageMessage().GetCaption())
+		case qm.GetVideoMessage() != nil:
+			quotedText = mediaDisplayText(MessageKindVideo, "", qm.GetVideoMessage().GetCaption())
+		case qm.GetAudioMessage() != nil:
+			quotedText = mediaDisplayText(MessageKindAudio, "", "")
+		case qm.GetDocumentMessage() != nil:
+			doc := qm.GetDocumentMessage()
+			quotedText = mediaDisplayText(MessageKindDocument, doc.GetFileName(), doc.GetCaption())
+		case qm.GetStickerMessage() != nil:
+			quotedText = mediaDisplayText(MessageKindSticker, "", "")
+		}
+	}
+	return quotedID, quotedSender, quotedText
 }
 
 func (eh *eventHandler) contactForMessage(info types.MessageInfo) (string, string, string) {
@@ -1398,8 +1848,40 @@ func downloadableFromMessage(msg Message) (whatsmeow.DownloadableMessage, error)
 		if media := msg.RawMessage.GetDocumentMessage(); media != nil {
 			return media, nil
 		}
+	case MessageKindSticker:
+		if media := msg.RawMessage.GetStickerMessage(); media != nil {
+			return media, nil
+		}
 	}
 	return nil, errors.New("This is not a downloadable message")
+}
+
+func (sm *SessionManager) prefetchChatStickers(msgs []Message, limit int) {
+	count := 0
+	for i := len(msgs) - 1; i >= 0 && count < limit; i-- {
+		if msgs[i].Kind == MessageKindSticker {
+			sm.prefetchStickerPreview(msgs[i])
+			count++
+		}
+	}
+}
+
+func (sm *SessionManager) prefetchStickerPreview(msg Message) {
+	if !config.Config.General.InlineImages || msg.Kind != MessageKindSticker || msg.RawMessage == nil {
+		return
+	}
+	if sm.client == nil || !sm.client.IsConnected() {
+		return
+	}
+	fullPath := filepath.Join(config.Config.General.PreviewPath, DownloadFileName(msg))
+	if _, err := os.Stat(fullPath); err == nil {
+		return
+	}
+	if _, err := sm.downloadMessage(msg, true); err == nil {
+		if sm.currentReceiver == msg.ChatId {
+			sm.uiHandler.NewScreen(sm.getMessages(msg.ChatId))
+		}
+	}
 }
 
 func readUploadFile(path string) ([]byte, string, string, error) {
@@ -1440,7 +1922,7 @@ func stripMimeParams(value string) string {
 	return value
 }
 
-func downloadFileName(msg Message) string {
+func DownloadFileName(msg Message) string {
 	if msg.FileName != "" {
 		safeName := path.Base(strings.ReplaceAll(msg.FileName, "\\", "/"))
 		if safeName != "" && safeName != "." && safeName != ".." {
@@ -1453,7 +1935,14 @@ func downloadFileName(msg Message) string {
 			ext = exts[0]
 		}
 	}
+	if ext == "" && (msg.MimeType == "image/webp" || msg.Kind == MessageKindSticker) {
+		ext = ".webp"
+	}
 	return msg.Id + ext
+}
+
+func downloadFileName(msg Message) string {
+	return DownloadFileName(msg)
 }
 
 func uploadMediaType(kind MessageKind) whatsmeow.MediaType {
@@ -1493,6 +1982,8 @@ func mediaDisplayText(kind MessageKind, fileName, caption string) string {
 		label = "[AUDIO]"
 	case MessageKindDocument:
 		label = "[DOCUMENT]"
+	case MessageKindSticker:
+		label = "[STICKER]"
 	}
 	parts := []string{label}
 	if fileName != "" && kind == MessageKindDocument {

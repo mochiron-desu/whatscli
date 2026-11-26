@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,6 +28,16 @@ var curRegions []messages.Message
 var allChats []messages.Chat
 var chatSearchMode bool = false
 var chatSearchQuery string = ""
+var viewingArchived bool = false
+var replyTargetMsg *messages.Message
+var expandedImages = make(map[string]bool)
+
+type archivedNavAction int
+
+const (
+	navOpenArchived archivedNavAction = iota + 1
+	navBackToChats
+)
 
 var textView *tview.TextView
 var treeView *tview.TreeView
@@ -47,11 +58,14 @@ func main() {
 	verbose := flag.Bool("verbose", false, "enable verbose debug logging to file")
 	verboseShort := flag.Bool("v", false, "enable verbose debug logging to file (shorthand)")
 	logFile := flag.String("log", "", "path to debug log file (implies --verbose)")
+	pairPhone := flag.String("pair-phone", "", "link device using phone number (international format, e.g. 919876543210) instead of QR code")
 	flag.Parse()
 
 	config.InitConfig()
 	uiHandler = UiHandler{}
-	sessionManager = &messages.SessionManager{}
+	sessionManager = &messages.SessionManager{
+		PairPhone: *pairPhone,
+	}
 	if *verbose || *verboseShort || *logFile != "" {
 		logPath := *logFile
 		if logPath == "" {
@@ -96,6 +110,7 @@ func main() {
 		})
 	textView.SetBackgroundColor(tcell.ColorNames[config.Config.Colors.Background])
 	textView.SetTextColor(tcell.ColorNames[config.Config.Colors.Text])
+	attachTextViewMouseHandler()
 
 	PrintHelp()
 
@@ -165,22 +180,54 @@ func MakeTree() *tview.TreeView {
 		SetCurrentNode(chatRoot)
 	treeView.SetBackgroundColor(tcell.ColorNames[config.Config.Colors.Background])
 
-	// If a chat was selected, open it.
-	treeView.SetChangedFunc(func(node *tview.TreeNode) {
+	openTreeNode := func(node *tview.TreeNode, focusInput bool, allowNav bool) {
+		if node == nil {
+			return
+		}
 		reference := node.GetReference()
 		if reference == nil {
-			SetDisplayedChat(messages.Chat{"", false, "", 0, 0})
-			return // Selecting the root node does nothing.
+			SetDisplayedChat(messages.Chat{"", false, "", 0, 0, false, false, 0})
+			return
+		}
+		if nav, ok := reference.(archivedNavAction); ok {
+			if !allowNav {
+				return
+			}
+			switch nav {
+			case navOpenArchived:
+				viewingArchived = true
+			case navBackToChats:
+				viewingArchived = false
+			}
+			renderChats(allChats, "")
+			if children := chatRoot.GetChildren(); len(children) > 0 {
+				treeView.SetCurrentNode(children[0])
+			} else {
+				treeView.SetCurrentNode(chatRoot)
+			}
+			syncScreen()
+			return
 		}
 		children := node.GetChildren()
 		if len(children) == 0 {
-			// Load and show files in this directory.
 			recv := reference.(messages.Chat)
 			SetDisplayedChat(recv)
+			if focusInput && app != nil {
+				app.SetFocus(textInput)
+			}
 		} else {
-			// Collapse if visible, expand if collapsed.
 			node.SetExpanded(!node.IsExpanded())
 		}
+	}
+
+	treeView.SetSelectedFunc(func(node *tview.TreeNode) {
+		openTreeNode(node, true, true)
+	})
+	treeView.SetChangedFunc(func(node *tview.TreeNode) {
+		if config.Config.Ui.SelectOnEnter {
+			return
+		}
+		openTreeNode(node, false, false)
 	})
 	return treeView
 }
@@ -283,6 +330,40 @@ func handleMessageCommand(command string) func(ev *tcell.EventKey) *tcell.EventK
 		}
 		return nil
 	}
+}
+
+func clearReplyTarget() {
+	replyTargetMsg = nil
+	if textInput != nil {
+		textInput.SetLabel("")
+	}
+}
+
+func handleReplyMessage(ev *tcell.EventKey) *tcell.EventKey {
+	hls := textView.GetHighlights()
+	if len(hls) == 0 {
+		return nil
+	}
+	for _, val := range curRegions {
+		if val.Id == hls[0] {
+			msgCopy := val
+			replyTargetMsg = &msgCopy
+			label := msgCopy.ContactShort
+			if msgCopy.FromMe {
+				label = "Me"
+			}
+			if label == "" {
+				label = "message"
+			}
+			textInput.SetLabel("Reply to " + label + ": ")
+			ResetMsgSelection()
+			if app != nil {
+				app.SetFocus(textInput)
+			}
+			break
+		}
+	}
+	return nil
 }
 
 func handleMessagesMove(amount int) func(ev *tcell.EventKey) *tcell.EventKey {
@@ -411,6 +492,9 @@ func LoadShortcuts() {
 	if err := keysMessages.Set(config.Config.Keymap.MessageRevoke, handleMessageCommand("revoke")); err != nil {
 		PrintErrorMsg("message_revoke:", err)
 	}
+	if err := keysMessages.Set(config.Config.Keymap.MessageReply, handleReplyMessage); err != nil {
+		PrintErrorMsg("message_reply:", err)
+	}
 	keysMessages.SetKey(tcell.ModNone, tcell.KeyEscape, handleExitMessages)
 	keysMessages.SetKey(tcell.ModNone, tcell.KeyUp, handleMessagesMove(-1))
 	keysMessages.SetKey(tcell.ModNone, tcell.KeyDown, handleMessagesMove(1))
@@ -428,6 +512,12 @@ func LoadShortcuts() {
 	keysChatPanel.SetRune(tcell.ModCtrl, 'd', handleChatPanelDown)
 	treeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if !chatSearchMode {
+			if event.Key() == tcell.KeyEscape && viewingArchived {
+				viewingArchived = false
+				renderChats(allChats, "")
+				syncScreen()
+				return nil
+			}
 			if event.Key() == tcell.KeyRune && event.Rune() == '/' {
 				chatSearchMode = true
 				chatSearchQuery = ""
@@ -499,10 +589,16 @@ func PrintHelp() {
 	fmt.Fprintln(textView, "[::b] Up/Down[::-] = select message")
 	fmt.Fprintln(textView, "[::b]", config.Config.Keymap.MessageDownload, "[::-] = Download attachment")
 	fmt.Fprintln(textView, "[::b]", config.Config.Keymap.MessageOpen, "[::-] = Download & open attachment")
-	fmt.Fprintln(textView, "[::b]", config.Config.Keymap.MessageShow, "[::-] = Download & show image using", config.Config.General.ShowCommand)
+	fmt.Fprintln(textView, "[::b]", config.Config.Keymap.MessageShow, "[::-] = Show image / sticker in color")
 	fmt.Fprintln(textView, "[::b]", config.Config.Keymap.MessageUrl, "[::-] = Find URL in message and open it")
 	fmt.Fprintln(textView, "[::b]", config.Config.Keymap.MessageRevoke, "[::-] = Revoke message")
 	fmt.Fprintln(textView, "[::b]", config.Config.Keymap.MessageInfo, "[::-] = Info about message")
+	fmt.Fprintln(textView, "[::b]", config.Config.Keymap.MessageReply, "[::-] = Reply / quote message")
+	fmt.Fprintln(textView, "[::b] Double-click image/sticker [::-] = Toggle full-size view")
+	fmt.Fprintln(textView, "")
+	fmt.Fprintln(textView, "[-::-]Chats panel[-::-]")
+	fmt.Fprintln(textView, "[::b] Enter [::-] = Open chat")
+	fmt.Fprintln(textView, "[::b] / [::-] = Search chats (Esc to clear)")
 	fmt.Fprintln(textView, "")
 	fmt.Fprintln(textView, "Config file in ->", config.GetConfigFilePath())
 	fmt.Fprintln(textView, "")
@@ -522,10 +618,14 @@ func PrintCommands() {
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"reset[::-]  = Remove stored session and reconnect cleanly")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"quit [::-]or[::b]", config.Config.Keymap.CommandQuit, "[::-] = Exit app")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"search[::-] [query]  = Search/filter chats (or press / in chat list)")
+	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"archived[::-]  = Toggle Archived chats view")
 	fmt.Fprintln(textView, "")
 	fmt.Fprintln(textView, "[-::-]Chat[-::-]")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"backlog [::-]or[::b]", config.Config.Keymap.CommandBacklog, "[::-] = load next", config.Config.General.BacklogMsgQuantity, "previous messages")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"read [::-]or[::b]", config.Config.Keymap.CommandRead, "[::-] = mark new messages in chat as read")
+	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"archive / "+cmdPrefix+"unarchive[::-]  = Archive or unarchive current chat")
+	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"pin / "+cmdPrefix+"unpin[::-]  = Pin or unpin current chat")
+	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"mute [hours|forever] / "+cmdPrefix+"unmute[::-]  = Mute or unmute current chat")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"upload[::-] /path/to/file  = Upload any file as document")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"sendimage[::-] /path/to/file  = Send image message")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"sendvideo[::-] /path/to/file  = Send video message")
@@ -547,11 +647,12 @@ func PrintCommands() {
 
 // called when text is entered by the user
 func EnterCommand(key tcell.Key) {
-	if sndTxt == "" {
-		return
-	}
 	if key == tcell.KeyEsc {
 		textInput.SetText("")
+		clearReplyTarget()
+		return
+	}
+	if sndTxt == "" {
 		return
 	}
 	cmdPrefix := config.Config.General.CmdPrefix
@@ -565,6 +666,19 @@ func EnterCommand(key tcell.Key) {
 		chatSearchMode = true
 		chatSearchQuery = query
 		renderChats(allChats, chatSearchQuery)
+		app.SetFocus(treeView)
+		syncScreen()
+		textInput.SetText("")
+		return
+	}
+	if sndTxt == cmdPrefix+"archived" {
+		viewingArchived = !viewingArchived
+		renderChats(allChats, "")
+		if children := chatRoot.GetChildren(); len(children) > 0 {
+			treeView.SetCurrentNode(children[0])
+		} else {
+			treeView.SetCurrentNode(chatRoot)
+		}
 		app.SetFocus(treeView)
 		syncScreen()
 		textInput.SetText("")
@@ -597,10 +711,19 @@ func EnterCommand(key tcell.Key) {
 		textInput.SetText("")
 		return
 	}
-	// no command, send as message
-	msg := messages.Command{
-		Name:   "send",
-		Params: []string{currentReceiver.Id, sndTxt},
+	// no command, send as message (or reply if quoting)
+	var msg messages.Command
+	if replyTargetMsg != nil {
+		msg = messages.Command{
+			Name:   "reply",
+			Params: []string{currentReceiver.Id, replyTargetMsg.Id, sndTxt},
+		}
+		clearReplyTarget()
+	} else {
+		msg = messages.Command{
+			Name:   "send",
+			Params: []string{currentReceiver.Id, sndTxt},
+		}
 	}
 	sessionManager.CommandChannel <- msg
 	textInput.SetText("")
@@ -662,10 +785,30 @@ func PrintErrorMsg(text string, err error) {
 	fmt.Fprintln(textView, "["+config.Config.Colors.Negative+"]", text, err.Error(), "[-]")
 }
 
-// prints an image attachment to the TextView (by message id)
+// prints an image or sticker attachment to the TextView
 func PrintImage(path string) {
+	showCmd := strings.TrimSpace(config.Config.General.ShowCommand)
+	cmdParts := strings.Fields(showCmd)
+	useBuiltin := showCmd == "" || showCmd == "builtin"
+	if !useBuiltin && len(cmdParts) > 0 {
+		if _, lookErr := exec.LookPath(cmdParts[0]); lookErr != nil {
+			useBuiltin = true
+		}
+	}
+
+	if useBuiltin {
+		maxCols, maxRows := getFullFitImageSize()
+		art, err := renderFileToTviewCached(path, maxCols, maxRows)
+		if err != nil {
+			PrintError(err)
+			return
+		}
+		fmt.Fprintln(textView, art)
+		syncScreen()
+		return
+	}
+
 	var err error
-	cmdParts := strings.Split(config.Config.General.ShowCommand, " ")
 	cmdParts = append(cmdParts, path)
 	var cmd *exec.Cmd
 	size := len(cmdParts)
@@ -713,9 +856,84 @@ func UpdateStatusBar(statusInfo messages.SessionStatus) {
 	//infoBar.SetText("🔋: ??%")
 }
 
+func getFullFitImageSize() (int, int) {
+	maxCols, maxRows := 90, 32
+	if textView != nil {
+		_, _, w, h := textView.GetInnerRect()
+		if w > 6 {
+			maxCols = w - 4
+		}
+		if h > 4 {
+			maxRows = h - 2
+		}
+	}
+	if maxCols < 20 {
+		maxCols = 20
+	}
+	if maxRows < 10 {
+		maxRows = 10
+	}
+	return maxCols, maxRows
+}
+
+func toggleExpandImageMessage(msgID string) bool {
+	var target *messages.Message
+	for idx := range curRegions {
+		if curRegions[idx].Id == msgID {
+			target = &curRegions[idx]
+			break
+		}
+	}
+	if target == nil || (target.Kind != messages.MessageKindImage && target.Kind != messages.MessageKindSticker) {
+		return false
+	}
+
+	if expandedImages[target.Id] {
+		delete(expandedImages, target.Id)
+	} else {
+		expandedImages[target.Id] = true
+		previewFile := filepath.Join(config.Config.General.PreviewPath, messages.DownloadFileName(*target))
+		if _, err := os.Stat(previewFile); err != nil && sessionManager != nil && sessionManager.CommandChannel != nil {
+			cmd := messages.Command{Name: "preview", Params: []string{target.Id}}
+			select {
+			case sessionManager.CommandChannel <- cmd:
+			default:
+				go func() {
+					sessionManager.CommandChannel <- cmd
+				}()
+			}
+		}
+	}
+
+	screen := getMessagesString(curRegions)
+	textView.SetText(screen)
+	textView.Highlight(target.Id)
+	textView.ScrollToHighlight()
+	syncScreen()
+	return true
+}
+
+func attachTextViewMouseHandler() {
+	textView.SetMouseCapture(func(action tview.MouseAction, event *tcell.EventMouse) (tview.MouseAction, *tcell.EventMouse) {
+		if action == tview.MouseLeftDoubleClick && event != nil {
+			x, y := event.Position()
+			if textView.InRect(x, y) {
+				if hls := textView.GetHighlights(); len(hls) > 0 {
+					if toggleExpandImageMessage(hls[0]) {
+						return action, nil
+					}
+				}
+			}
+		}
+		return action, event
+	})
+}
+
 // sets the current chat, loads text from storage to TextView
 func SetDisplayedChat(wid messages.Chat) {
 	//TODO: how to get chat to set
+	clearReplyTarget()
+	expandedImages = make(map[string]bool)
 	currentReceiver = wid
 	textView.Clear()
 	textView.SetTitle(wid.Name)
@@ -747,13 +965,68 @@ func getTextMessageString(msg *messages.Message) string {
 	out += "[\""
 	out += msg.Id
 	out += "\"]"
+	if msg.QuotedText != "" {
+		qPreview := strings.ReplaceAll(msg.QuotedText, "\n", " ")
+		if runes := []rune(qPreview); len(runes) > 80 {
+			qPreview = string(runes[:77]) + "..."
+		}
+		qSender := msg.QuotedSender
+		if qSender == "" {
+			qSender = "message"
+		}
+		out += "[-::d]  ↱ " + tview.Escape(qSender) + ": " + tview.Escape(qPreview) + "[-::-]\n"
+	}
 	if msg.FromMe { //msg from me
 		out += "[-::d](" + time + ") [" + colorMe + "::b]Me: [-::-]" + text
 	} else { // message from others
 		out += "[-::d](" + time + ") [" + colorContact + "::b]" + msg.ContactShort + ": [-::-]" + text
 	}
+	if config.Config.General.InlineImages {
+		expanded := expandedImages[msg.Id]
+		if msg.Kind == messages.MessageKindImage {
+			maxCols, maxRows := 34, 12
+			if expanded {
+				maxCols, maxRows = getFullFitImageSize()
+			}
+			var art string
+			var err error
+			previewFile := filepath.Join(config.Config.General.PreviewPath, messages.DownloadFileName(*msg))
+			if expanded {
+				art, err = renderFileToTviewCached(previewFile, maxCols, maxRows)
+			}
+			if (!expanded || err != nil) && msg.RawMessage != nil {
+				if thumb := msg.RawMessage.GetImageMessage().GetJPEGThumbnail(); len(thumb) > 0 {
+					art, err = renderBytesToTviewCached("thumb:"+msg.Id, thumb, maxCols, maxRows)
+				} else if !expanded {
+					art, err = renderFileToTviewCached(previewFile, maxCols, maxRows)
+				}
+			} else if !expanded && err == nil && art == "" {
+				art, err = renderFileToTviewCached(previewFile, maxCols, maxRows)
+			}
+			if err == nil && art != "" {
+				out += "\n" + indentBlock(art, "  ")
+			}
+		} else if msg.Kind == messages.MessageKindSticker {
+			maxCols, maxRows := 24, 12
+			if expanded {
+				maxCols, maxRows = getFullFitImageSize()
+			}
+			previewFile := filepath.Join(config.Config.General.PreviewPath, messages.DownloadFileName(*msg))
+			if art, err := renderFileToTviewCached(previewFile, maxCols, maxRows); err == nil && art != "" {
+				out += "\n" + indentBlock(art, "  ")
+			}
+		}
+	}
 	out += "[\"\"]"
 	return out
+}
+
+func indentBlock(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = prefix + line
+	}
+	return strings.Join(lines, "\n")
 }
 
 type UiHandler struct{}
@@ -785,16 +1058,53 @@ func (u UiHandler) NewScreen(msgs []messages.Message) {
 }
 
 func renderChats(ids []messages.Chat, query string) {
+	title := "Chats"
+	if viewingArchived {
+		title = "Archived"
+	}
 	if chatSearchMode {
-		chatRoot.SetText("Chats (/" + query + ")")
+		chatRoot.SetText(title + " (/" + query + ")")
 	} else {
-		chatRoot.SetText("Chats")
+		chatRoot.SetText(title)
 	}
 	chatRoot.ClearChildren()
 	oldId := currentReceiver.Id
 	q := strings.ToLower(query)
+
+	archivedCount := 0
+	for _, element := range ids {
+		if element.Archived {
+			archivedCount++
+		}
+	}
+
+	if q == "" {
+		if !viewingArchived && archivedCount > 0 {
+			archNode := tview.NewTreeNode(fmt.Sprintf("Archived (%d)", archivedCount)).
+				SetReference(navOpenArchived).
+				SetSelectable(true).
+				SetColor(tcell.ColorNames[config.Config.Colors.ListHeader])
+			chatRoot.AddChild(archNode)
+		} else if viewingArchived {
+			backNode := tview.NewTreeNode("<- Back to Chats").
+				SetReference(navBackToChats).
+				SetSelectable(true).
+				SetColor(tcell.ColorNames[config.Config.Colors.ListHeader])
+			chatRoot.AddChild(backNode)
+		}
+	}
+
 	var firstMatch *tview.TreeNode
 	for _, element := range ids {
+		if q == "" {
+			if viewingArchived && !element.Archived {
+				continue
+			}
+			if !viewingArchived && element.Archived {
+				continue
+			}
+		}
+
 		name := element.Name
 		if name == "" {
 			name = strings.TrimSuffix(strings.TrimSuffix(element.Id, messages.GROUPSUFFIX), messages.CONTACTSUFFIX)
@@ -802,10 +1112,21 @@ func renderChats(ids []messages.Chat, query string) {
 		if q != "" && !strings.Contains(strings.ToLower(name), q) && !strings.Contains(strings.ToLower(element.Id), q) {
 			continue
 		}
-		if element.Unread > 0 {
-			name += " ([" + config.Config.Colors.UnreadCount + "]" + fmt.Sprint(element.Unread) + "[-])"
+
+		label := name
+		if element.Pinned && !element.Archived {
+			label = "(P) " + label
 		}
-		node := tview.NewTreeNode(name).
+		if element.IsMuted() {
+			label += " (M)"
+		}
+		if q != "" && element.Archived {
+			label += " (A)"
+		}
+		if element.Unread > 0 {
+			label += " ([" + config.Config.Colors.UnreadCount + "]" + fmt.Sprint(element.Unread) + "[-])"
+		}
+		node := tview.NewTreeNode(label).
 			SetReference(element).
 			SetSelectable(true)
 		if element.IsGroup {

@@ -28,6 +28,8 @@ type General struct {
 	UseTerminalBell     bool
 	NotificationTimeout int64
 	BacklogMsgQuantity  int
+	AutoMarkRead        bool
+	InlineImages        bool
 }
 
 type Keymap struct {
@@ -48,10 +50,12 @@ type Keymap struct {
 	MessageUrl      string
 	MessageInfo     string
 	MessageRevoke   string
+	MessageReply    string
 }
 
 type Ui struct {
 	ChatSidebarWidth int
+	SelectOnEnter    bool
 }
 
 type Colors struct {
@@ -76,11 +80,13 @@ var Config = IniFile{
 		DownloadPath:        GetHomeDir() + "Downloads",
 		PreviewPath:         GetHomeDir() + "Downloads",
 		CmdPrefix:           "/",
-		ShowCommand:         "jp2a --color",
+		ShowCommand:         "builtin",
 		EnableNotifications: false,
 		UseTerminalBell:     false,
 		NotificationTimeout: 60,
 		BacklogMsgQuantity:  10,
+		AutoMarkRead:        true,
+		InlineImages:        true,
 	},
 	&Keymap{
 		SwitchPanels:    "Tab",
@@ -100,9 +106,11 @@ var Config = IniFile{
 		MessageUrl:      "u",
 		MessageRevoke:   "r",
 		MessageShow:     "s",
+		MessageReply:    "q",
 	},
 	&Ui{
 		ChatSidebarWidth: 30,
+		SelectOnEnter:    true,
 	},
 	&Colors{
 		Background:      "black",

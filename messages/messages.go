@@ -3,6 +3,7 @@ package messages
 
 import (
 	"io"
+	"time"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 )
@@ -56,6 +57,7 @@ const (
 	MessageKindVideo    MessageKind = "video"
 	MessageKindAudio    MessageKind = "audio"
 	MessageKindDocument MessageKind = "document"
+	MessageKindSticker  MessageKind = "sticker"
 	MessageKindUnknown  MessageKind = "unknown"
 )
 
@@ -75,6 +77,9 @@ type Message struct {
 	MimeType     string
 	FileName     string
 	Unread       bool
+	QuotedId     string
+	QuotedSender string
+	QuotedText   string
 	RawMessage   *waProto.Message
 }
 
@@ -86,6 +91,14 @@ type Chat struct {
 	Unread  int
 	//TODO: convert to uint64
 	LastMessage int64
+	Archived    bool
+	Pinned      bool
+	MutedUntil  int64 // 0 = not muted, -1 = muted forever, >0 = unix seconds
+}
+
+// IsMuted reports whether the chat is currently muted.
+func (c Chat) IsMuted() bool {
+	return c.MutedUntil == -1 || c.MutedUntil > time.Now().Unix()
 }
 
 type Contact struct {

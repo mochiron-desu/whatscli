@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/gdamore/tcell/v2"
@@ -17,12 +18,14 @@ func setupTestUI(t *testing.T) {
 	}
 	app.SetScreen(simScreen)
 
-	textView = tview.NewTextView().SetDynamicColors(true)
+	textView = tview.NewTextView().SetDynamicColors(true).SetRegions(true)
+	attachTextViewMouseHandler()
 	textInput = tview.NewInputField()
 	sessionManager = &messages.SessionManager{
 		CommandChannel: make(chan messages.Command, 16),
 	}
 	currentReceiver = messages.Chat{}
+	expandedImages = make(map[string]bool)
 	treeView = MakeTree()
 	LoadShortcuts()
 
@@ -33,6 +36,7 @@ func setupTestUI(t *testing.T) {
 	}
 	chatSearchMode = false
 	chatSearchQuery = ""
+	viewingArchived = false
 	renderChats(allChats, "")
 }
 
@@ -123,5 +127,133 @@ func TestTreeSearchEnterSelectsChat(t *testing.T) {
 		}
 	default:
 		t.Fatalf("expected select command on CommandChannel")
+	}
+}
+
+func TestQuoteReplyFlow(t *testing.T) {
+	setupTestUI(t)
+	currentReceiver = messages.Chat{Id: "111@s.whatsapp.net", Name: "Alice"}
+	curRegions = []messages.Message{
+		{Id: "orig-42", ChatId: "111@s.whatsapp.net", ContactShort: "Alice", Text: "are you free?"},
+	}
+	textView.SetText(getMessagesString(curRegions))
+	textView.Highlight("orig-42")
+
+	handleReplyMessage(nil)
+	if replyTargetMsg == nil || replyTargetMsg.Id != "orig-42" {
+		t.Fatalf("expected replyTargetMsg 'orig-42', got %+v", replyTargetMsg)
+	}
+
+	sndTxt = "yes!"
+	EnterCommand(tcell.KeyEnter)
+
+	if replyTargetMsg != nil {
+		t.Fatalf("expected replyTargetMsg cleared after send")
+	}
+	select {
+	case cmd := <-sessionManager.CommandChannel:
+		if cmd.Name != "reply" || len(cmd.Params) != 3 || cmd.Params[0] != "111@s.whatsapp.net" || cmd.Params[1] != "orig-42" || cmd.Params[2] != "yes!" {
+			t.Fatalf("unexpected reply command: %+v", cmd)
+		}
+	default:
+		t.Fatalf("expected reply command on CommandChannel")
+	}
+}
+
+func TestGetTextMessageStringShowsQuote(t *testing.T) {
+	msg := &messages.Message{
+		Id:           "m1",
+		FromMe:       true,
+		Timestamp:    1700000000,
+		Text:         "on my way",
+		QuotedSender: "Alice",
+		QuotedText:   "where are you?",
+	}
+	got := getTextMessageString(msg)
+	if !strings.Contains(got, "↱ Alice: where are you?") {
+		t.Fatalf("expected quote preview in rendered message, got %q", got)
+	}
+}
+
+func TestArchivedViewSwitchAndBack(t *testing.T) {
+	setupTestUI(t)
+	allChats = []messages.Chat{
+		{Id: "1@s.whatsapp.net", Name: "Pinned Active", Pinned: true},
+		{Id: "2@s.whatsapp.net", Name: "Normal Active"},
+		{Id: "3@s.whatsapp.net", Name: "Old Archived", Archived: true},
+		{Id: "4@s.whatsapp.net", Name: "Muted Archived", Archived: true, MutedUntil: -1},
+	}
+	renderChats(allChats, "")
+
+	children := chatRoot.GetChildren()
+	if len(children) != 3 {
+		t.Fatalf("expected Archived(2) + 2 active chats, got %d", len(children))
+	}
+	if children[0].GetText() != "Archived (2)" {
+		t.Fatalf("expected first node 'Archived (2)', got %q", children[0].GetText())
+	}
+	if children[1].GetText() != "(P) Pinned Active" {
+		t.Fatalf("expected pinned prefix, got %q", children[1].GetText())
+	}
+
+	// Simulate Enter on Archived (2)
+	treeView.SetCurrentNode(children[0])
+	treeView.InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), func(p tview.Primitive) {})
+	if !viewingArchived || chatRoot.GetText() != "Archived" {
+		t.Fatalf("expected viewingArchived=true and title 'Archived', got %v / %q", viewingArchived, chatRoot.GetText())
+	}
+	archChildren := chatRoot.GetChildren()
+	if len(archChildren) != 3 {
+		t.Fatalf("expected Back + 2 archived chats, got %d", len(archChildren))
+	}
+	if archChildren[0].GetText() != "<- Back to Chats" {
+		t.Fatalf("expected '<- Back to Chats', got %q", archChildren[0].GetText())
+	}
+	if !strings.Contains(archChildren[2].GetText(), "(M)") {
+		t.Fatalf("expected muted badge on muted archived chat, got %q", archChildren[2].GetText())
+	}
+
+	// Simulate Enter on <- Back to Chats
+	treeView.SetCurrentNode(archChildren[0])
+	treeView.InputHandler()(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone), func(p tview.Primitive) {})
+	if viewingArchived || chatRoot.GetText() != "Chats" {
+		t.Fatalf("expected viewingArchived=false and title 'Chats', got %v / %q", viewingArchived, chatRoot.GetText())
+	}
+	if got := len(chatRoot.GetChildren()); got != 3 {
+		t.Fatalf("expected 3 nodes back in Chats view, got %d", got)
+	}
+}
+
+func TestDoubleClickTogglesExpandedImage(t *testing.T) {
+	setupTestUI(t)
+	textView.SetRect(0, 0, 120, 40)
+	cols, rows := getFullFitImageSize()
+	if cols != 116 || rows != 38 {
+		t.Fatalf("expected full-fit size 116x38, got %dx%d", cols, rows)
+	}
+
+	curRegions = []messages.Message{
+		{Id: "img-99", ChatId: "111@s.whatsapp.net", Kind: messages.MessageKindImage, Text: "[IMAGE]"},
+	}
+	textView.SetText(getMessagesString(curRegions))
+	textView.Highlight("img-99")
+
+	capture := textView.GetMouseCapture()
+	capture(tview.MouseLeftDoubleClick, tcell.NewEventMouse(10, 5, tcell.Button1, tcell.ModNone))
+	if !expandedImages["img-99"] {
+		t.Fatalf("expected img-99 to be expanded after double-click")
+	}
+	select {
+	case cmd := <-sessionManager.CommandChannel:
+		if cmd.Name != "preview" || len(cmd.Params) != 1 || cmd.Params[0] != "img-99" {
+			t.Fatalf("unexpected preview command: %+v", cmd)
+		}
+	default:
+		t.Fatalf("expected preview command queued on double-click")
+	}
+
+	capture(tview.MouseLeftDoubleClick, tcell.NewEventMouse(10, 5, tcell.Button1, tcell.ModNone))
+	if expandedImages["img-99"] {
+		t.Fatalf("expected img-99 to collapse on second double-click")
 	}
 }

@@ -1,6 +1,8 @@
 package messages
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -134,5 +136,103 @@ func TestIncomingLIDMessageUsesSenderAltWhenAvailable(t *testing.T) {
 	}
 	if msg.ChatId != pnJID.String() || msg.SenderId != pnJID.String() {
 		t.Fatalf("expected %s, got chat=%q sender=%q", pnJID.String(), msg.ChatId, msg.SenderId)
+	}
+}
+
+func TestMessageFromInfoExtractsQuotedReply(t *testing.T) {
+	sm := &SessionManager{}
+	sm.Init(nil)
+
+	pnJID := types.NewJID("919130918271", types.DefaultUserServer)
+	sm.db.AddContact(Contact{Id: pnJID.String(), Name: "Anurag TAABI", Short: "Anurag TAABI"})
+
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:   pnJID,
+				Sender: pnJID,
+			},
+			ID:        "reply-1",
+			Timestamp: time.Unix(400, 0),
+		},
+		Message: &waProto.Message{
+			ExtendedTextMessage: &waProto.ExtendedTextMessage{
+				Text: proto.String("sounds good"),
+				ContextInfo: &waProto.ContextInfo{
+					StanzaID:    proto.String("orig-1"),
+					Participant: proto.String(pnJID.String()),
+					QuotedMessage: &waProto.Message{
+						Conversation: proto.String("meet at 5?"),
+					},
+				},
+			},
+		},
+	}
+
+	msg, _, ok := sm.eventHandler.normalizeEventMessage(evt)
+	if !ok {
+		t.Fatalf("expected normalized reply message")
+	}
+	if msg.QuotedId != "orig-1" || msg.QuotedSender != "Anurag TAABI" || msg.QuotedText != "meet at 5?" {
+		t.Fatalf("unexpected quoted fields: id=%q sender=%q text=%q", msg.QuotedId, msg.QuotedSender, msg.QuotedText)
+	}
+}
+
+func TestMessageFromInfoHandlesSticker(t *testing.T) {
+	sm := &SessionManager{}
+	sm.Init(nil)
+
+	pnJID := types.NewJID("919130918271", types.DefaultUserServer)
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:   pnJID,
+				Sender: pnJID,
+			},
+			ID:        "stk-1",
+			Timestamp: time.Unix(500, 0),
+		},
+		Message: &waProto.Message{
+			StickerMessage: &waProto.StickerMessage{
+				Mimetype: proto.String("image/webp"),
+			},
+		},
+	}
+
+	msg, _, ok := sm.eventHandler.normalizeEventMessage(evt)
+	if !ok {
+		t.Fatalf("expected normalized sticker message")
+	}
+	if msg.Kind != MessageKindSticker || msg.Text != "[STICKER]" {
+		t.Fatalf("expected MessageKindSticker / [STICKER], got kind=%q text=%q", msg.Kind, msg.Text)
+	}
+	if fn := DownloadFileName(msg); fn != "stk-1.webp" {
+		t.Fatalf("expected stk-1.webp, got %q", fn)
+	}
+	if dl, err := downloadableFromMessage(msg); err != nil || dl == nil {
+		t.Fatalf("expected downloadable sticker, got dl=%v err=%v", dl, err)
+	}
+}
+
+func TestNormalizeUploadPath(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "Screenshot from 2026-11-26 16-12-21.png")
+	if err := os.WriteFile(target, []byte("png"), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"double-quoted", `"` + target + `"`},
+		{"single-quoted", `'` + target + `'`},
+		{"escaped-spaces", filepath.Join(dir, `Screenshot\ from\ 2026-11-26\ 16-12-21.png`)},
+		{"file-uri", "file://" + filepath.Join(dir, "Screenshot%20from%202026-11-26%2016-12-21.png")},
+	}
+	for _, tc := range cases {
+		if got := normalizeUploadPath(tc.input); got != target {
+			t.Fatalf("%s: expected %q, got %q", tc.name, target, got)
+		}
 	}
 }
