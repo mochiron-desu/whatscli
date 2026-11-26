@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -22,6 +24,9 @@ var VERSION string = "v1.1.6"
 var sndTxt string = ""
 var currentReceiver messages.Chat = messages.Chat{}
 var curRegions []messages.Message
+var allChats []messages.Chat
+var chatSearchMode bool = false
+var chatSearchQuery string = ""
 
 var textView *tview.TextView
 var treeView *tview.TreeView
@@ -39,9 +44,26 @@ var keyBindings *cbind.Configuration
 var uiHandler messages.UiMessageHandler
 
 func main() {
+	verbose := flag.Bool("verbose", false, "enable verbose debug logging to file")
+	verboseShort := flag.Bool("v", false, "enable verbose debug logging to file (shorthand)")
+	logFile := flag.String("log", "", "path to debug log file (implies --verbose)")
+	flag.Parse()
+
 	config.InitConfig()
 	uiHandler = UiHandler{}
 	sessionManager = &messages.SessionManager{}
+	if *verbose || *verboseShort || *logFile != "" {
+		logPath := *logFile
+		if logPath == "" {
+			logPath = config.GetSessionFilePath() + ".log"
+		}
+		if logger, closer, err := messages.NewFileLogger(logPath, "whatscli", "DEBUG"); err == nil {
+			sessionManager.Logger = logger
+			defer closer.Close()
+		} else {
+			fmt.Fprintf(os.Stderr, "failed to open log file %s: %v\n", logPath, err)
+		}
+	}
 	sessionManager.Init(uiHandler)
 
 	app = tview.NewApplication()
@@ -90,24 +112,28 @@ func main() {
 			offset, _ := textView.GetScrollOffset()
 			offset += 1
 			textView.ScrollTo(offset, 0)
+			syncScreen()
 			return nil
 		}
 		if event.Key() == tcell.KeyUp {
 			offset, _ := textView.GetScrollOffset()
 			offset -= 1
 			textView.ScrollTo(offset, 0)
+			syncScreen()
 			return nil
 		}
 		if event.Key() == tcell.KeyPgDn {
 			offset, _ := textView.GetScrollOffset()
 			offset += 10
 			textView.ScrollTo(offset, 0)
+			syncScreen()
 			return nil
 		}
 		if event.Key() == tcell.KeyPgUp {
 			offset, _ := textView.GetScrollOffset()
 			offset -= 10
 			textView.ScrollTo(offset, 0)
+			syncScreen()
 			return nil
 		}
 		return event
@@ -278,6 +304,7 @@ func handleMessagesMove(amount int) func(ev *tcell.EventKey) *tcell.EventKey {
 			}
 		}
 		textView.ScrollToHighlight()
+		syncScreen()
 		return nil
 	}
 }
@@ -297,6 +324,7 @@ func handleMessagesLast(ev *tcell.EventKey) *tcell.EventKey {
 	}
 	textView.Highlight(curRegions[len(curRegions)-1].Id)
 	textView.ScrollToHighlight()
+	syncScreen()
 	return nil
 }
 
@@ -306,6 +334,7 @@ func handleMessagesFirst(ev *tcell.EventKey) *tcell.EventKey {
 	}
 	textView.Highlight(curRegions[0].Id)
 	textView.ScrollToHighlight()
+	syncScreen()
 	return nil
 }
 
@@ -397,7 +426,62 @@ func LoadShortcuts() {
 	keysChatPanel := cbind.NewConfiguration()
 	keysChatPanel.SetRune(tcell.ModCtrl, 'u', handleChatPanelUp)
 	keysChatPanel.SetRune(tcell.ModCtrl, 'd', handleChatPanelDown)
-	treeView.SetInputCapture(keysChatPanel.Capture)
+	treeView.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if !chatSearchMode {
+			if event.Key() == tcell.KeyRune && event.Rune() == '/' {
+				chatSearchMode = true
+				chatSearchQuery = ""
+				renderChats(allChats, chatSearchQuery)
+				syncScreen()
+				return nil
+			}
+			switch event.Key() {
+			case tcell.KeyUp, tcell.KeyDown, tcell.KeyPgUp, tcell.KeyPgDn, tcell.KeyHome, tcell.KeyEnd:
+				syncScreen()
+			case tcell.KeyRune:
+				if event.Rune() == 'j' || event.Rune() == 'k' {
+					syncScreen()
+				}
+			}
+			return keysChatPanel.Capture(event)
+		}
+
+		switch event.Key() {
+		case tcell.KeyEscape:
+			chatSearchMode = false
+			chatSearchQuery = ""
+			renderChats(allChats, "")
+			syncScreen()
+			return nil
+		case tcell.KeyEnter:
+			node := treeView.GetCurrentNode()
+			chatSearchMode = false
+			chatSearchQuery = ""
+			if node != nil {
+				if recv, ok := node.GetReference().(messages.Chat); ok && recv.Id != "" {
+					SetDisplayedChat(recv)
+				}
+			}
+			renderChats(allChats, "")
+			syncScreen()
+			app.SetFocus(textInput)
+			return nil
+		case tcell.KeyBackspace, tcell.KeyBackspace2:
+			runes := []rune(chatSearchQuery)
+			if len(runes) > 0 {
+				chatSearchQuery = string(runes[:len(runes)-1])
+				renderChats(allChats, chatSearchQuery)
+				syncScreen()
+			}
+			return nil
+		case tcell.KeyRune:
+			chatSearchQuery += string(event.Rune())
+			renderChats(allChats, chatSearchQuery)
+			syncScreen()
+			return nil
+		}
+		return event
+	})
 }
 
 // prints help to chat view
@@ -437,6 +521,7 @@ func PrintCommands() {
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"logout[::-]  = Remove login data from computer")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"reset[::-]  = Remove stored session and reconnect cleanly")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"quit [::-]or[::b]", config.Config.Keymap.CommandQuit, "[::-] = Exit app")
+	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"search[::-] [query]  = Search/filter chats (or press / in chat list)")
 	fmt.Fprintln(textView, "")
 	fmt.Fprintln(textView, "[-::-]Chat[-::-]")
 	fmt.Fprintln(textView, "[::b] "+cmdPrefix+"backlog [::-]or[::b]", config.Config.Keymap.CommandBacklog, "[::-] = load next", config.Config.General.BacklogMsgQuantity, "previous messages")
@@ -472,6 +557,16 @@ func EnterCommand(key tcell.Key) {
 	cmdPrefix := config.Config.General.CmdPrefix
 	if sndTxt == cmdPrefix+"help" {
 		PrintHelp()
+		textInput.SetText("")
+		return
+	}
+	if sndTxt == cmdPrefix+"search" || strings.HasPrefix(sndTxt, cmdPrefix+"search ") {
+		query := strings.TrimSpace(strings.TrimPrefix(sndTxt, cmdPrefix+"search"))
+		chatSearchMode = true
+		chatSearchQuery = query
+		renderChats(allChats, chatSearchQuery)
+		app.SetFocus(treeView)
+		syncScreen()
 		textInput.SetText("")
 		return
 	}
@@ -531,12 +626,19 @@ func GetOffsetMsgId(curId string, offset int) string {
 	}
 }
 
+func syncScreen() {
+	if app != nil {
+		go app.Sync()
+	}
+}
+
 // resets the selection in the textView and scrolls it down
 func ResetMsgSelection() {
 	if len(textView.GetHighlights()) > 0 {
 		textView.Highlight("")
 	}
 	textView.ScrollToEnd()
+	syncScreen()
 }
 
 // prints text to the TextView
@@ -678,44 +780,60 @@ func (u UiHandler) NewScreen(msgs []messages.Message) {
 				PrintText("[::d] ~~~ no messages, press " + config.Config.Keymap.CommandBacklog + " to load backlog if available ~~~[::-]")
 			}
 		}
+		syncScreen()
 	})
+}
+
+func renderChats(ids []messages.Chat, query string) {
+	if chatSearchMode {
+		chatRoot.SetText("Chats (/" + query + ")")
+	} else {
+		chatRoot.SetText("Chats")
+	}
+	chatRoot.ClearChildren()
+	oldId := currentReceiver.Id
+	q := strings.ToLower(query)
+	var firstMatch *tview.TreeNode
+	for _, element := range ids {
+		name := element.Name
+		if name == "" {
+			name = strings.TrimSuffix(strings.TrimSuffix(element.Id, messages.GROUPSUFFIX), messages.CONTACTSUFFIX)
+		}
+		if q != "" && !strings.Contains(strings.ToLower(name), q) && !strings.Contains(strings.ToLower(element.Id), q) {
+			continue
+		}
+		if element.Unread > 0 {
+			name += " ([" + config.Config.Colors.UnreadCount + "]" + fmt.Sprint(element.Unread) + "[-])"
+		}
+		node := tview.NewTreeNode(name).
+			SetReference(element).
+			SetSelectable(true)
+		if element.IsGroup {
+			node.SetColor(tcell.ColorNames[config.Config.Colors.ListGroup])
+		} else {
+			node.SetColor(tcell.ColorNames[config.Config.Colors.ListContact])
+		}
+		if element.Id == oldId {
+			currentReceiver = element
+		}
+		chatRoot.AddChild(node)
+		if firstMatch == nil {
+			firstMatch = node
+		}
+		if element.Id == currentReceiver.Id && q == "" {
+			treeView.SetCurrentNode(node)
+		}
+	}
+	if q != "" && firstMatch != nil {
+		treeView.SetCurrentNode(firstMatch)
+	}
 }
 
 // loads the chat data from storage to the TreeView
 func (u UiHandler) SetChats(ids []messages.Chat) {
 	go app.QueueUpdateDraw(func() {
-		chatRoot.ClearChildren()
-		oldId := currentReceiver.Id
-		for _, element := range ids {
-			name := element.Name
-			if name == "" {
-				name = strings.TrimSuffix(strings.TrimSuffix(element.Id, messages.GROUPSUFFIX), messages.CONTACTSUFFIX)
-			}
-			if element.Unread > 0 {
-				name += " ([" + config.Config.Colors.UnreadCount + "]" + fmt.Sprint(element.Unread) + "[-])"
-				//tim := time.Unix(element.LastMessage, 0)
-				//sin := time.Since(tim)
-				//since := fmt.Sprintf("%s", sin)
-				//time := tim.Format("02-01-06 15:04:05")
-				//name += since
-			}
-			node := tview.NewTreeNode(name).
-				SetReference(element).
-				SetSelectable(true)
-			if element.IsGroup {
-				node.SetColor(tcell.ColorNames[config.Config.Colors.ListGroup])
-			} else {
-				node.SetColor(tcell.ColorNames[config.Config.Colors.ListContact])
-			}
-			// store new currentReceiver, else the selection on the left goes off
-			if element.Id == oldId {
-				currentReceiver = element
-			}
-			chatRoot.AddChild(node)
-			if element.Id == currentReceiver.Id {
-				treeView.SetCurrentNode(node)
-			}
-		}
+		allChats = ids
+		renderChats(allChats, chatSearchQuery)
 	})
 }
 

@@ -47,6 +47,8 @@ type SessionManager struct {
 	lastSent        time.Time
 	started         bool
 	eventHandler    *eventHandler
+	Logger          waLog.Logger
+	lidResolver     func(types.JID) (types.JID, error)
 }
 
 // Init initializes the SessionManager.
@@ -54,6 +56,9 @@ func (sm *SessionManager) Init(handler UiMessageHandler) {
 	sm.db = &MessageDatabase{}
 	sm.db.Init()
 	sm.uiHandler = handler
+	if sm.Logger == nil {
+		sm.Logger = waLog.Noop
+	}
 	sm.BatteryChannel = make(chan BatteryMsg, 10)
 	sm.StatusChannel = make(chan StatusMsg, 10)
 	sm.CommandChannel = make(chan Command, 10)
@@ -61,6 +66,40 @@ func (sm *SessionManager) Init(handler UiMessageHandler) {
 	sm.ContactChannel = make(chan Contact, 10)
 	sm.TextChannel = make(chan *waProto.Message, 10)
 	sm.eventHandler = &eventHandler{sm: sm}
+}
+
+func (sm *SessionManager) log() waLog.Logger {
+	if sm.Logger == nil {
+		return waLog.Noop
+	}
+	return sm.Logger
+}
+
+func (sm *SessionManager) resolveCanonicalJID(jid, alt types.JID) types.JID {
+	if jid.IsEmpty() {
+		return jid
+	}
+	jid = jid.ToNonAD()
+	if jid.Server != types.HiddenUserServer {
+		return jid
+	}
+	if !alt.IsEmpty() && alt.Server == types.DefaultUserServer {
+		return alt.ToNonAD()
+	}
+	if sm.lidResolver != nil {
+		if pn, err := sm.lidResolver(jid); err == nil && !pn.IsEmpty() {
+			return pn.ToNonAD()
+		}
+	} else if sm.client != nil && sm.client.Store != nil && sm.client.Store.LIDs != nil {
+		if pn, err := sm.client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && !pn.IsEmpty() {
+			return pn.ToNonAD()
+		}
+	}
+	return jid
+}
+
+func (sm *SessionManager) normalizeJID(jid types.JID) types.JID {
+	return sm.resolveCanonicalJID(jid, types.EmptyJID)
 }
 
 // StartManager starts the receiver and message handling goroutine.
@@ -132,7 +171,7 @@ func (sm *SessionManager) setCurrentReceiver(id string) {
 func (sm *SessionManager) getConnection() (*whatsmeow.Client, error) {
 	if sm.client == nil {
 		dbPath := config.GetSessionFilePath() + ".db"
-		container, err := sqlstore.New(context.Background(), "sqlite3", "file:"+dbPath+"?_foreign_keys=on", waLog.Noop)
+		container, err := sqlstore.New(context.Background(), "sqlite3", "file:"+dbPath+"?_foreign_keys=on", sm.log().Sub("DB"))
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to database: %v", err)
 		}
@@ -140,7 +179,7 @@ func (sm *SessionManager) getConnection() (*whatsmeow.Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to get device: %v", err)
 		}
-		client := whatsmeow.NewClient(deviceStore, waLog.Noop)
+		client := whatsmeow.NewClient(deviceStore, sm.log().Sub("Client"))
 		client.AddEventHandler(sm.eventHandler.Handle)
 		sm.client = client
 		sm.container = container
@@ -230,7 +269,9 @@ func (sm *SessionManager) loadRecentChats() {
 
 	if sm.client.Store != nil && sm.client.Store.Contacts != nil {
 		contacts, err := sm.client.Store.Contacts.GetAllContacts(context.Background())
-		if err == nil {
+		if err != nil {
+			sm.log().Warnf("loadRecentChats: GetAllContacts error: %v", err)
+		} else {
 			for jid, contact := range contacts {
 				if jid.Server != types.DefaultUserServer {
 					continue
@@ -252,8 +293,11 @@ func (sm *SessionManager) loadRecentChats() {
 		}
 	}
 
+	groupCount := 0
 	groups, err := sm.client.GetJoinedGroups(context.Background())
-	if err == nil {
+	if err != nil {
+		sm.log().Warnf("loadRecentChats: GetJoinedGroups error: %v", err)
+	} else {
 		for _, group := range groups {
 			sm.db.AddChat(Chat{
 				Id:      group.JID.String(),
@@ -261,9 +305,11 @@ func (sm *SessionManager) loadRecentChats() {
 				Name:    group.Name,
 			})
 			addedChats++
+			groupCount++
 		}
 	}
 
+	sm.log().Infof("loadRecentChats: addedChats=%d groups=%d", addedChats, groupCount)
 	sm.uiHandler.SetChats(sm.db.GetChatIds())
 	if addedChats > 0 {
 		sm.uiHandler.PrintText(fmt.Sprintf("Loaded %d chats", addedChats))
@@ -282,20 +328,42 @@ func (sm *SessionManager) loadContacts() {
 	}
 
 	contactCount := 0
-	for jid, contact := range contacts {
+	addContactEntry := func(jid types.JID, contact types.ContactInfo) {
+		canon := sm.normalizeJID(jid)
 		name := contact.FullName
+		if name == "" {
+			name = contact.FirstName
+		}
 		if name == "" {
 			name = contact.PushName
 		}
 		if name == "" {
-			name = jid.User
+			name = canon.User
+		}
+		shortName := contact.FullName
+		if shortName == "" {
+			shortName = contact.FirstName
+		}
+		if shortName == "" {
+			shortName = contact.PushName
 		}
 		sm.db.AddContact(Contact{
-			Id:    jid.String(),
+			Id:    canon.String(),
 			Name:  name,
-			Short: contact.PushName,
+			Short: shortName,
 		})
 		contactCount++
+	}
+	// Process phone-number JIDs first so saved FullName isn't shadowed by @lid push-names.
+	for jid, contact := range contacts {
+		if jid.Server == types.DefaultUserServer {
+			addContactEntry(jid, contact)
+		}
+	}
+	for jid, contact := range contacts {
+		if jid.Server != types.DefaultUserServer {
+			addContactEntry(jid, contact)
+		}
 	}
 	if contactCount > 0 {
 		sm.uiHandler.PrintText(fmt.Sprintf("Loaded %d contacts", contactCount))
@@ -303,6 +371,7 @@ func (sm *SessionManager) loadContacts() {
 }
 
 func (sm *SessionManager) getChatName(jid types.JID) string {
+	jid = sm.normalizeJID(jid)
 	if jid.Server == types.GroupServer {
 		groupInfo, err := sm.client.GetGroupInfo(context.Background(), jid)
 		if err == nil && groupInfo.Name != "" {
@@ -314,6 +383,9 @@ func (sm *SessionManager) getChatName(jid types.JID) string {
 		if err == nil && contact.Found {
 			if contact.FullName != "" {
 				return contact.FullName
+			}
+			if contact.FirstName != "" {
+				return contact.FirstName
 			}
 			if contact.PushName != "" {
 				return contact.PushName
@@ -450,14 +522,16 @@ func (sm *SessionManager) loadBacklog() {
 	}
 
 	existingMessages := sm.db.GetMessages(sm.currentReceiver)
+	sm.log().Infof("loadBacklog: receiver=%s existingMessages=%d", sm.currentReceiver, len(existingMessages))
 	sm.uiHandler.PrintText("Retrieving message history...")
 
 	oldest, ok := sm.db.GetOldestMessage(sm.currentReceiver)
 	if !ok {
+		sm.log().Infof("loadBacklog: no local message anchor for receiver=%s", sm.currentReceiver)
 		sm.uiHandler.PrintText("No local message anchor found yet. Open the chat after WhatsApp sync delivers some history, then try /backlog again.")
-		sm.uiHandler.NewScreen(existingMessages)
 		return
 	}
+	sm.log().Infof("loadBacklog: anchor id=%s ts=%d fromMe=%v", oldest.Id, oldest.Timestamp, oldest.FromMe)
 
 	senderJID := types.EmptyJID
 	if oldest.SenderId != "" {
@@ -476,27 +550,25 @@ func (sm *SessionManager) loadBacklog() {
 		Timestamp: time.Unix(int64(oldest.Timestamp), 0),
 	}, config.Config.General.BacklogMsgQuantity)
 	if _, err = sm.client.SendPeerMessage(context.Background(), req); err != nil {
+		sm.log().Warnf("loadBacklog: SendPeerMessage failed: %v", err)
 		sm.uiHandler.PrintError(fmt.Errorf("failed to request message history: %v", err))
 		sm.uiHandler.NewScreen(existingMessages)
 		return
 	}
+	sm.log().Infof("loadBacklog: SendPeerMessage succeeded for receiver=%s", sm.currentReceiver)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for len(sm.db.GetMessages(sm.currentReceiver)) == len(existingMessages) && time.Now().Before(deadline) {
 		time.Sleep(250 * time.Millisecond)
 	}
 
-	if len(sm.db.GetMessages(sm.currentReceiver)) == len(existingMessages) {
-		sm.uiHandler.PrintText("Requested older messages from WhatsApp. Waiting for sync response.")
-	}
-
 	updated := sm.db.GetMessages(sm.currentReceiver)
+	sm.log().Infof("loadBacklog: after wait updated=%d existing=%d", len(updated), len(existingMessages))
 	if len(updated) > len(existingMessages) {
-		sm.uiHandler.PrintText(fmt.Sprintf("Loaded %d additional messages", len(updated)-len(existingMessages)))
+		sm.uiHandler.NewScreen(updated)
 	} else {
 		sm.uiHandler.PrintText("No additional messages found. WhatsApp may limit history access.")
 	}
-	sm.uiHandler.NewScreen(updated)
 }
 
 func (sm *SessionManager) resetSession() {
@@ -968,11 +1040,22 @@ type eventHandler struct {
 }
 
 func (eh *eventHandler) Handle(evt interface{}) {
+	eh.sm.log().Debugf("event: %T", evt)
 	switch v := evt.(type) {
 	case *events.Message:
+		eh.sm.log().Infof("event.Message: chat=%s sender=%s id=%s ts=%v", v.Info.Chat.String(), v.Info.Sender.String(), v.Info.ID, v.Info.Timestamp)
 		eh.handleLiveMessage(v)
 	case *events.HistorySync:
+		if v != nil && v.Data != nil {
+			eh.sm.log().Infof("event.HistorySync: type=%v progress=%d conversations=%d", v.Data.GetSyncType(), v.Data.GetProgress(), len(v.Data.GetConversations()))
+		}
 		eh.handleHistorySync(v)
+	case *events.OfflineSyncPreview:
+		eh.sm.log().Infof("event.OfflineSyncPreview: total=%d messages=%d receipts=%d notifications=%d appData=%d", v.Total, v.Messages, v.Receipts, v.Notifications, v.AppDataChanges)
+	case *events.OfflineSyncCompleted:
+		eh.sm.log().Infof("event.OfflineSyncCompleted: count=%d", v.Count)
+	case *events.AppStateSyncComplete:
+		eh.sm.log().Infof("event.AppStateSyncComplete: name=%v", v.Name)
 	case *events.Connected:
 		eh.sm.StatusChannel <- StatusMsg{true, nil}
 	case *events.Disconnected:
@@ -1021,6 +1104,10 @@ func (eh *eventHandler) handleHistorySync(evt *events.HistorySync) {
 		return
 	}
 
+	totalConvs := 0
+	totalParsed := 0
+	totalSkipped := 0
+	lidChats := 0
 	for _, conv := range evt.Data.GetConversations() {
 		chatID := conv.GetID()
 		if chatID == "" {
@@ -1034,8 +1121,30 @@ func (eh *eventHandler) handleHistorySync(evt *events.HistorySync) {
 		if err != nil {
 			continue
 		}
+		totalConvs++
+		if chatJID.Server == types.HiddenUserServer {
+			lidChats++
+			eh.sm.log().Debugf("handleHistorySync: @lid chat=%s pnJID=%s name=%q msgs=%d", chatID, conv.GetPnJID(), conv.GetName(), len(conv.GetMessages()))
+			var altJID types.JID
+			if conv.GetPnJID() != "" {
+				if parsedPN, pnErr := types.ParseJID(conv.GetPnJID()); pnErr == nil {
+					altJID = parsedPN
+				}
+			}
+			chatJID = eh.sm.resolveCanonicalJID(chatJID, altJID)
+			chatID = chatJID.String()
+		}
 
-		chatName := conv.GetName()
+		chatName := ""
+		if chatJID.Server == types.DefaultUserServer {
+			resolvedName := eh.sm.getChatName(chatJID)
+			if resolvedName != "" && resolvedName != chatJID.User {
+				chatName = resolvedName
+			}
+		}
+		if chatName == "" {
+			chatName = conv.GetName()
+		}
 		if chatName == "" {
 			chatName = conv.GetDisplayName()
 		}
@@ -1058,25 +1167,41 @@ func (eh *eventHandler) handleHistorySync(evt *events.HistorySync) {
 		for _, histMsg := range conv.GetMessages() {
 			webMsg := histMsg.GetMessage()
 			if webMsg == nil {
+				totalSkipped++
 				continue
 			}
 			parsed, err := eh.sm.client.ParseWebMessage(chatJID, webMsg)
 			if err != nil {
+				totalSkipped++
 				continue
 			}
 			msg, action, ok := eh.normalizeEventMessage(parsed)
 			if !ok || action != "" {
+				totalSkipped++
 				continue
 			}
 			eh.sm.db.AddMessage(msg, false)
+			totalParsed++
 		}
 		eh.sm.db.UpdateChatUnread(chatID, int(conv.GetUnreadCount()))
 	}
 
+	eh.sm.log().Infof("handleHistorySync: convs=%d lidChats=%d parsed=%d skipped=%d", totalConvs, lidChats, totalParsed, totalSkipped)
 	eh.sm.uiHandler.SetChats(eh.sm.db.GetChatIds())
 	if eh.sm.currentReceiver != "" {
 		eh.sm.uiHandler.NewScreen(eh.sm.getMessages(eh.sm.currentReceiver))
 	}
+}
+
+func (eh *eventHandler) canonicalChatJID(info types.MessageInfo) types.JID {
+	if !info.IsGroup {
+		alt := info.SenderAlt
+		if info.IsFromMe {
+			alt = info.RecipientAlt
+		}
+		return eh.sm.resolveCanonicalJID(info.Chat, alt)
+	}
+	return info.Chat.ToNonAD()
 }
 
 func (eh *eventHandler) normalizeEventMessage(evt *events.Message) (Message, string, bool) {
@@ -1088,7 +1213,7 @@ func (eh *eventHandler) normalizeEventMessage(evt *events.Message) (Message, str
 		if protocol.GetType() == waProto.ProtocolMessage_REVOKE && protocol.GetKey() != nil {
 			return Message{
 				Id:     protocol.GetKey().GetID(),
-				ChatId: evt.Info.Chat.String(),
+				ChatId: eh.canonicalChatJID(evt.Info).String(),
 			}, "revoke", true
 		}
 		return Message{}, "ignore", false
@@ -1103,16 +1228,20 @@ func (eh *eventHandler) messageFromInfo(info types.MessageInfo, raw *waProto.Mes
 		return Message{}, false
 	}
 
-	chatID := info.Chat.String()
+	chatJID := eh.canonicalChatJID(info)
+	chatID := chatJID.String()
 	if chatID == "" {
 		return Message{}, false
 	}
+	senderJID := eh.sm.resolveCanonicalJID(info.Sender, info.SenderAlt)
+	info.Chat = chatJID
+	info.Sender = senderJID
 
 	contactID, contactName, contactShort := eh.contactForMessage(info)
 	msg := Message{
 		Id:           string(info.ID),
 		ChatId:       chatID,
-		SenderId:     info.Sender.String(),
+		SenderId:     senderJID.String(),
 		ContactId:    contactID,
 		ContactName:  contactName,
 		ContactShort: contactShort,
@@ -1177,11 +1306,15 @@ func (eh *eventHandler) contactForMessage(info types.MessageInfo) (string, strin
 }
 
 func (eh *eventHandler) getContactName(jid types.JID) string {
+	jid = eh.sm.normalizeJID(jid)
 	if eh.sm.client != nil && eh.sm.client.Store != nil && eh.sm.client.Store.Contacts != nil {
 		contact, err := eh.sm.client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.Found {
 			if contact.FullName != "" {
 				return contact.FullName
+			}
+			if contact.FirstName != "" {
+				return contact.FirstName
 			}
 			if contact.PushName != "" {
 				return contact.PushName
@@ -1192,10 +1325,19 @@ func (eh *eventHandler) getContactName(jid types.JID) string {
 }
 
 func (eh *eventHandler) getContactShort(jid types.JID) string {
+	jid = eh.sm.normalizeJID(jid)
 	if eh.sm.client != nil && eh.sm.client.Store != nil && eh.sm.client.Store.Contacts != nil {
 		contact, err := eh.sm.client.Store.Contacts.GetContact(context.Background(), jid)
-		if err == nil && contact.Found && contact.PushName != "" {
-			return contact.PushName
+		if err == nil && contact.Found {
+			if contact.FullName != "" {
+				return contact.FullName
+			}
+			if contact.FirstName != "" {
+				return contact.FirstName
+			}
+			if contact.PushName != "" {
+				return contact.PushName
+			}
 		}
 	}
 	return eh.sm.db.GetIdShort(jid.String())
